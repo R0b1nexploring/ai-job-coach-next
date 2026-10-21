@@ -1,0 +1,87 @@
+name: coach-next
+
+x-application: &application
+  image: coach-next:personal
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 210s
+  environment:
+    COACH_DATA_DIR: /data
+    COACH_JOURNAL_DIR: /journal
+    COACH_FONT_PATH: /usr/share/fonts/truetype/wqy/wqy-microhei.ttc
+    COACH_DATABASE_URL: ${COACH_DATABASE_URL:-}
+    COACH_DB_HOST: postgres
+    COACH_DB_PORT: "5432"
+    COACH_DB_NAME: ${POSTGRES_DB:-coach}
+    COACH_DB_USER: ${POSTGRES_USER:-coach}
+    COACH_DB_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.docker.example to .env and set POSTGRES_PASSWORD}
+    COACH_PROVIDER: ${COACH_PROVIDER:-local}
+    COACH_API_BASE_URL: ${COACH_API_BASE_URL:-}
+    COACH_API_KEY: ${COACH_API_KEY:-}
+    COACH_MODEL: ${COACH_MODEL:-}
+    COACH_TIMEOUT_SECONDS: ${COACH_TIMEOUT_SECONDS:-90}
+    COACH_WORKER_HEARTBEAT_SECONDS: "5"
+    COACH_WORKER_HEARTBEAT_MAX_AGE: "30"
+    COACH_WORKER_STALL_SECONDS: "600"
+  volumes:
+    - data:/data
+    - journal:/journal
+
+services:
+  postgres:
+    image: postgres:16.13-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-coach}
+      POSTGRES_USER: ${POSTGRES_USER:-coach}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  migrate:
+    <<: *application
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  worker:
+    <<: *application
+    command: ["worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.runtime", "check-worker"]
+      interval: 10s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+  api:
+    <<: *application
+    build: .
+    command: ["api"]
+    ports:
+      - "${COACH_BIND_IP:-127.0.0.1}:${COACH_PORT:-8827}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "scripts/container_entrypoint.py", "check-api"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  postgres:
+  data:
+  journal:

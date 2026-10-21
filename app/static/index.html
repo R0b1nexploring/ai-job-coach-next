@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>双版本简历工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="app-navigation">
+      <div class="brand"><span class="brand-mark">简</span><span>求职工作台</span></div>
+      <p class="nav-caption">主要功能</p>
+      <nav aria-label="页面导航"><a class="nav-link active" href="#input-heading">简历工作台</a><a class="nav-link" href="#result-heading">面试指南</a><a class="nav-link" href="#batch-history">历史记录</a></nav>
+      <div class="sidebar-note">独立重写 · 个人本机版<br><span id="provider-note">正在检查模型配置…</span></div>
+    </aside>
+    <main>
+      <section class="hero">
+        <div class="eyebrow">简历工作台 / 双版本生成</div>
+        <h1>把岗位要求，变成可准备的简历。</h1>
+        <p>从一份岗位描述开始，生成求职版、蓝图 Plus 和各自对应的面试指南。</p>
+      </section>
+      <div class="workspace">
+        <section class="panel input-panel" aria-labelledby="input-heading">
+          <div class="section-heading"><span class="step">01</span><div><h2 id="input-heading">准备输入</h2><p>先从一份明确的 JD 开始</p></div></div>
+          <form id="generator-form">
+            <label for="jd">岗位描述 <span class="required">必填</span></label>
+            <textarea id="jd" name="jd" required minlength="20" maxlength="15000" placeholder="粘贴岗位职责、任职要求和你关注的方向。建议保留原文。"></textarea>
+            <div class="field-caption"><span>要求会从这段文字中提取</span><span id="jd-count">0 / 15000</span></div>
+            <label for="material">个人素材 <span class="optional">可选</span></label>
+            <input id="material-file" type="file" accept=".docx,.pdf,.txt">
+            <span id="upload-status" class="field-caption">上传后会提取文字供你核对，不会自动标为已确认。</span>
+            <textarea id="material" name="material" maxlength="20000" placeholder="可写课程项目、实习、科研、竞赛或技能。没有素材也可以先生成项目规划草稿。"></textarea>
+            <div class="field-caption"><span>可手工修改提取后的文字</span><span id="material-count">0 / 20000</span></div>
+            <label class="checkbox-row"><input type="checkbox" id="confirmed"><span>我已核对上方素材，内容是我真实做过或取得的</span></label>
+            <button class="primary" id="generate" type="submit">生成双版本与指南 <span aria-hidden="true">↗</span></button>
+            <p class="form-note">AI 补充保留待核验状态，不会自动变成已确认事实。本版限个人本机使用。</p>
+          </form>
+        </section>
+        <section class="panel result-panel" aria-labelledby="result-heading">
+          <div class="section-heading"><span class="step">02</span><div><h2 id="result-heading">查看成果</h2><p>两份简历与各自的准备指南</p></div></div>
+          <div id="status" class="status" role="status">尚未生成。完成左侧输入后即可开始。</div>
+          <button id="retry-batch" class="secondary" type="button" hidden>重试生成</button>
+          <label for="batch-history">最近生成记录</label><select id="batch-history"><option value="">选择记录</option></select>
+          <div id="results" hidden>
+            <div class="tabs" role="tablist" aria-label="简历版本">
+              <button type="button" class="tab active" data-kind="job" role="tab" aria-selected="true">求职版</button>
+              <button type="button" class="tab" data-kind="blueprint" role="tab" aria-selected="false">蓝图 Plus</button>
+            </div>
+            <div id="resume" class="resume-card"></div>
+            <div class="result-actions"><button id="edit-resume" class="secondary" type="button">编辑本版</button><a id="download-html" href="#">HTML</a><a id="download-docx" href="#">DOCX</a><a id="download-pdf" href="#">PDF</a></div>
+            <form id="editor" hidden>
+              <fieldset class="header-fields"><legend>个人信息与教育经历</legend><p class="form-note">按自己的实际情况填写；未填写的位置会保留为空白区。</p>
+                <div class="header-input-grid"><div><label for="edit-name">姓名</label><input id="edit-name" data-header="name" maxlength="80" autocomplete="name"></div><div><label for="edit-phone">电话</label><input id="edit-phone" data-header="phone" maxlength="40" autocomplete="tel"></div><div><label for="edit-email">邮箱</label><input id="edit-email" data-header="email" maxlength="160" autocomplete="email"></div><div><label for="edit-location">所在城市</label><input id="edit-location" data-header="location" maxlength="80" autocomplete="address-level2"></div></div>
+                <label for="edit-education">教育经历</label><textarea id="edit-education" data-header="education" maxlength="1500" placeholder="学校、专业、学历、就读时间；可按行填写多段教育经历。"></textarea>
+              </fieldset>
+              <label for="edit-title">标题</label><input id="edit-title" maxlength="160"><label for="edit-summary">简介</label><textarea id="edit-summary" maxlength="1000"></textarea><div id="edit-items"></div><button id="add-item" class="secondary" type="button">增加要点</button><details><summary>编辑本版项目方案</summary><p class="form-note">方案与正文一起保存；更新后的指南将使用本版方案。</p><div id="edit-plans"></div></details><div class="result-actions"><button class="primary" type="submit">保存新版</button><button id="cancel-edit" class="secondary" type="button">取消</button></div><p id="edit-status" role="status"></p></form>
+            <details><summary>本版修订与指南历史</summary><div id="revision-history"></div></details>
+            <div class="guide-heading"><div><span class="small-label">面试准备</span><h3 id="guide-title">对应面试指南</h3></div><span id="guide-status" class="guide-badge"></span></div>
+            <a id="download-guide" class="guide-download" href="#" hidden>下载这份指南</a>
+            <div id="guide" class="guide-list"></div>
+            <button id="retry-guide" class="secondary" type="button" hidden>重试这份指南</button>
+            <div class="result-actions"><a id="download-data" href="#">导出本次全部资料</a><button id="delete-batch" class="secondary" type="button">删除本次资料</button></div>
+            <div id="delete-options" hidden><p>删除两版简历、指南和所有历史。后续恢复旧备份也会保留本次删除。</p><button id="confirm-delete" class="secondary" type="button">确定删除本次资料</button><button id="cancel-delete" class="secondary" type="button">保留资料</button></div>
+          </div>
+        </section>
+      </div>
+    </main>
+    <footer>个人本机版 · 双版本简历与面试指南 · AI 稿件需由你核对</footer>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

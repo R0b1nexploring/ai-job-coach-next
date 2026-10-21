@@ -1,0 +1,24 @@
+[project]
+name = "ai-job-coach-next"
+version = "0.1.0"
+description = "Independent dual-resume and interview-guide prototype"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "alembic>=1.16,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "psycopg[binary]>=3.2,<4",
+  "pypdf>=6.19.0",
+  "python-docx>=1.2.0",
+  "python-multipart>=0.0.32",
+  "reportlab>=5.0.1",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
