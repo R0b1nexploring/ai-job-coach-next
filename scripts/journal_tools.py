@@ -10,8 +10,8 @@ from pathlib import Path
 import tarfile
 
 from app.db import SessionLocal
-from app.models import Batch
-from app.privacy import _ids, _journal, _durable_file, installation_id, journal_path, JournalUnavailable
+from app.models import Batch, FactSnapshot, MaterialRevision
+from app.privacy import _ids, _intent_keys, _journal, _durable_file, installation_id, journal_path, JournalUnavailable
 from sqlalchemy import select
 
 
@@ -48,19 +48,21 @@ def import_journal(source: Path, session_factory=SessionLocal) -> None:
     if incoming.get("format") != 1 or not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
         raise JournalUnavailable("Journal identity invalid")
     incoming_ids = _ids(StringIO(values["deletions.jsonl"].decode()))
+    incoming_intents = _intent_keys(StringIO(values["deletions.jsonl"].decode()))
     if journal_path().exists():
         with _journal() as stream:
             current_ids = _ids(stream)
+            current_intents = _intent_keys(stream)
             same_installation = installation_id() == identifier
             with session_factory() as session:
-                has_business = session.scalar(select(Batch.id).limit(1)) is not None
-            if (same_installation and not current_ids <= incoming_ids) or (not same_installation and (has_business or current_ids)):
+                has_business = any(session.scalar(select(model.id).limit(1)) is not None for model in (Batch, FactSnapshot, MaterialRevision))
+            if (same_installation and not current_intents <= incoming_intents) or (not same_installation and (has_business or current_intents)):
                 raise JournalUnavailable("Cannot roll back or replace existing deletion state")
     else:
         marker = Path(os.getenv("COACH_DATA_DIR", "./data")) / ".installation-id"
         identity = journal_path().parent / "installation.json"
         with session_factory() as session:
-            has_business = session.scalar(select(Batch.id).limit(1)) is not None
+            has_business = any(session.scalar(select(model.id).limit(1)) is not None for model in (Batch, FactSnapshot, MaterialRevision))
         # An identity cannot prove which deletions a lost journal contained.
         # Enrollment is only safe for a genuinely new, empty installation.
         if marker.exists() or identity.exists() or has_business:

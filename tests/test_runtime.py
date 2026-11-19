@@ -81,7 +81,8 @@ def test_worker_drains_active_batch_without_claiming_guide(tmp_path, monkeypatch
     monkeypatch.setenv("COACH_DATA_DIR", str(tmp_path))
     stop = threading.Event()
     calls = []
-    def finish_batch(_sessions, _provider):
+    def finish_batch(_sessions, _provider, *, progress):
+        progress()
         calls.append("batch")
         stop.set()  # The signal handler uses the same event during an active call.
         return True

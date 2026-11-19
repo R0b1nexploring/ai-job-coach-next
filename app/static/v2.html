@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>Job Coach · 简历工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/v2.css">
+</head>
+<body class="v2-page">
+<a class="skip-link" href="#main-title">跳到当前步骤</a>
+<div class="v2-shell">
+  <header class="v2-header">
+    <div class="wordmark"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span>Job Coach</div>
+    <div class="header-tools"><span class="workspace-name">简历工作台</span>
+      <button id="open-history" class="quiet" type="button"><span aria-hidden="true" class="history-icon">↶</span>历史记录</button>
+      <button id="new-task" class="secondary" type="button"><span aria-hidden="true">＋</span> 新建任务</button>
+    </div>
+  </header>
+  <aside class="workflow-rail">
+    <button id="toggle-steps" type="button" aria-expanded="false" aria-controls="steps">制作流程 <span id="mobile-progress"></span><span aria-hidden="true">⌄</span></button>
+    <nav id="steps" aria-label="简历准备步骤">
+      <p class="nav-heading">准备资料</p>
+      <button type="button" data-step="0"><span>01</span>目标岗位</button>
+      <button type="button" data-step="1"><span>02</span>个人素材</button>
+      <button type="button" data-step="2"><span>03</span>事实核对</button>
+      <p class="nav-heading">制作与交付</p>
+      <button type="button" data-step="3"><span>04</span>生成简历</button>
+      <button type="button" data-step="4"><span>05</span>简历编辑</button>
+      <button type="button" data-step="5"><span>06</span>面试指南</button>
+      <button type="button" data-step="6"><span>07</span>导出文件</button>
+    </nav>
+  </aside>
+  <main class="v2-main">
+    <div class="v2-intro">
+      <div><p id="step-label" class="eyebrow"></p><h1 id="main-title" tabindex="-1"></h1><p id="step-description" class="v2-description"></p></div>
+      <div class="intro-tools">
+        <div id="kind-switch" class="version-switch" role="group" aria-label="简历版本" hidden><button type="button" data-kind="job" class="tab">求职版</button><button type="button" data-kind="blueprint" class="tab">蓝图 Plus</button></div>
+        <button id="open-context" class="quiet" type="button">查看任务资料</button>
+      </div>
+    </div>
+    <div id="message" class="status" role="status" aria-live="polite" hidden></div>
+    <div class="v2-columns">
+      <div class="v2-stage">
+        <div class="stage-body">
+          <section data-panel="0" class="v2-panel">
+            <div class="field-title"><label for="jd">岗位描述</label><span class="field-tag">必填</span><button id="paste-jd" type="button" class="quiet paste-link">粘贴</button></div>
+            <p class="field-note" id="jd-help">复制招聘页面上的岗位职责和任职要求，至少 20 字。</p>
+            <div class="writing-field"><textarea id="jd" maxlength="15000" aria-describedby="jd-help" placeholder="在这里粘贴目标岗位的职位描述…"></textarea><div class="writing-foot"><span>职位描述原文</span><output id="jd-count" for="jd">0 / 15,000</output></div></div>
+          </section>
+          <section data-panel="1" class="v2-panel" hidden>
+            <div class="field-title"><label for="material">个人素材</label><span class="field-tag neutral">选填</span></div>
+            <p class="field-note">每行写一条经历、技能或计划，下一步可逐条标注是否完成。也可以从文件或素材库导入。</p>
+            <div class="material-tools"><label for="material-file" class="secondary upload-control">↑ 上传文件<input id="material-file" type="file" accept=".docx,.pdf,.txt"></label><button id="open-library" class="secondary" type="button">打开素材库</button></div>
+            <p id="upload-note" class="field-note">支持 Word、文本 PDF 和 TXT。</p>
+            <textarea id="material" maxlength="20000" placeholder="我参与了什么项目？具体做了什么？有什么可以核对的结果？"></textarea>
+            <button id="extract" class="quiet fitted" type="button">重新提取事实候选</button>
+          </section>
+          <section data-panel="2" class="v2-panel" hidden>
+            <div class="v2-row"><h2>事实候选</h2><button id="reextract" class="quiet" type="button">重新提取</button></div>
+            <p id="fact-help" class="field-note">逐条选择类型和完成情况，再勾选你能确认的内容。计划中的事也可以确认，仍标记为计划。</p>
+            <div class="reader-nav" id="fact-navigation" hidden><label for="fact-picker">定位事实</label><select id="fact-picker"></select></div>
+            <div id="candidate-list" class="v2-scroll"></div><p id="candidate-empty" class="empty-note" hidden>还没有事实候选。可以继续生成，或返回个人素材补充经历。</p>
+          </section>
+          <section data-panel="3" class="v2-panel" hidden>
+            <h2>文档语言</h2>
+            <div class="v2-grid"><div><label for="resume-locale">简历语言</label><select id="resume-locale"><option value="zh-CN">中文</option><option value="en">English</option></select></div><div><label for="guide-locale">指南语言</label><select id="guide-locale"><option value="zh-CN">中文</option><option value="en">English</option></select></div></div>
+            <details class="option-section" id="profile-options"><summary>个人信息 <small>选填</small></summary>
+              <fieldset class="personal-info"><legend class="sr-only">个人信息</legend><div class="v2-grid"><div><label for="header-name">姓名</label><input id="header-name" autocomplete="off" maxlength="80"></div><div><label for="header-phone">电话</label><input id="header-phone" type="tel" autocomplete="off" maxlength="50"></div><div><label for="header-email">邮箱</label><input id="header-email" type="email" autocomplete="off" maxlength="160"></div><div><label for="header-location">所在城市</label><input id="header-location" autocomplete="off" maxlength="100"></div></div><label for="header-education">教育背景</label><textarea id="header-education" maxlength="1500" rows="2"></textarea></fieldset>
+            </details>
+            <div class="generation-note"><strong id="model-service">生成服务：正在读取…</strong><p>确认后，当前模型服务将处理岗位与选定的职业事实。联系方式单独用于简历抬头。请检查素材中是否还有多余的个人信息。</p></div>
+            <p id="generation-status" class="field-note" role="status"></p>
+          </section>
+          <section data-panel="4" class="v2-panel" hidden>
+            <div class="v2-row"><div><h2 id="resume-heading">本版简历</h2><p id="resume-status" class="field-note"></p></div><div class="material-tools"><button id="retry-batch" class="secondary" type="button" hidden>重试生成</button><button id="edit" class="secondary" type="button">编辑本版</button></div></div>
+            <div class="reader-nav" id="resume-navigation" hidden><label for="resume-picker">跳至章节</label><select id="resume-picker"></select></div>
+            <div id="resume-reader" class="v2-reader"></div><div id="editor" hidden></div>
+          </section>
+          <section data-panel="5" class="v2-panel" hidden>
+            <h2>本版面试指南</h2><p id="guide-status" class="field-note"></p>
+            <details id="guide-options" class="option-section"><summary>指南语言与更新</summary><div class="v2-guide-language"><div><label for="guide-new-locale">新指南语言</label><select id="guide-new-locale"><option value="zh-CN">中文</option><option value="en">English</option></select></div><button id="retry-guide" class="secondary" type="button" hidden>更新本版指南</button></div><p class="field-note">更新后可在历史记录中查看原指南及其对应的简历。</p></details>
+            <div class="reader-nav" id="guide-navigation" hidden><label for="guide-picker">跳至问题</label><select id="guide-picker"></select></div>
+            <div id="guide-reader" class="v2-reader"></div>
+          </section>
+          <section data-panel="6" class="v2-panel" hidden>
+            <h2>下载设置</h2><p id="export-status" class="field-note"></p>
+            <div class="v2-grid"><div><label for="export-paper">纸张</label><select id="export-paper"><option value="A4">A4</option><option value="Letter">Letter</option></select></div><div><label for="export-pages">简历目标页数</label><select id="export-pages"><option value="1">一页</option><option value="2">两页</option></select></div></div>
+            <p class="field-note">页数目标只用于简历。面试指南按内容自然分页，所有问题和回答都会保留。</p>
+            <div class="v2-export"><div><h3>当前简历</h3><div id="resume-downloads" class="v2-downloads"></div></div><div><h3>对应指南</h3><div id="guide-downloads" class="v2-downloads"></div></div></div><p id="guide-export-note" class="field-note"></p>
+            <div class="generation-note"><strong>完整草稿包</strong><p>两版简历及对应指南，共 8 份 Word 和 PDF，附版本清单。</p><p id="package-status" role="status"></p></div>
+            <details class="option-section"><summary>管理本次资料</summary><button id="delete-batch" class="danger-link" type="button">永久删除本次资料</button></details>
+          </section>
+        </div>
+        <footer class="v2-footer">
+          <button id="previous" class="quiet" type="button">← 上一步</button><span id="footer-hint" class="field-note"></span>
+          <button id="next" class="primary" type="button">下一步 →</button>
+          <button id="generate" class="primary" type="button" hidden>确认并生成双版本</button>
+          <button id="download-package" class="primary" type="button" hidden>下载完整草稿包</button>
+          <div id="editor-actions" class="material-tools" hidden><button id="cancel-edit" class="secondary" type="button">取消修改</button><button id="save-edit" class="primary" type="button">保存新版</button></div>
+        </footer>
+      </div>
+      <aside class="info-rail" id="info-rail" aria-label="任务资料与状态">
+        <div id="context-content">
+          <div class="delivery-card" id="delivery-card">
+            <div class="folder-art" aria-hidden="true"><div class="folder-back"></div><div class="sheet sheet-back"><i></i><b></b></div><div class="sheet sheet-front"><i></i><b></b></div><div class="folder-front"><i></i></div></div>
+            <h2>本次交付</h2><dl><div><dt>求职版简历</dt><dd>针对目标岗位整理经历</dd></div><div><dt>蓝图 Plus</dt><dd>对照目标，规划能力提升</dd></div><div><dt>面试指南</dt><dd>两版简历各配一份</dd></div></dl>
+          </div>
+          <section id="preparation-summary" class="reference-box" hidden>
+            <h2>生成前核对</h2>
+            <dl class="input-summary"><div><dt>目标岗位</dt><dd id="check-job"></dd></div><div><dt>个人素材</dt><dd id="check-material"></dd></div><div><dt>职业事实</dt><dd id="check-facts"></dd></div></dl>
+          </section>
+          <section class="reference-box"><h2>任务资料</h2><p id="context-state" class="field-note"></p>
+            <details><summary>岗位原文</summary><p id="context-jd" class="v2-source"></p></details>
+            <details><summary>素材原文</summary><p id="context-material" class="v2-source"></p></details>
+          </section>
+          <section id="result-state" class="reference-box" hidden><h2>生成状态</h2><p id="support-state" class="v2-source"></p><div id="support-detail" class="v2-support"></div></section>
+        </div>
+      </aside>
+    </div>
+  </main>
+</div>
+<dialog id="context-dialog" aria-labelledby="context-dialog-title"><div class="dialog-heading"><h2 id="context-dialog-title">任务资料与状态</h2><button class="quiet" id="close-context" type="button">关闭</button></div><div id="context-dialog-body" class="dialog-body"></div></dialog>
+<dialog id="library-dialog" aria-labelledby="library-title"><div class="dialog-heading"><h2 id="library-title">个人素材库</h2><button class="quiet" id="close-library" type="button">关闭</button></div>
+  <p class="field-note">保存经历后可在其他岗位复用。导入本次任务后，需要重新核对事实。</p>
+  <label for="library-select">已保存的素材</label><select id="library-select"></select><p id="library-preview" class="library-preview" hidden></p>
+  <div class="v2-library-actions"><button id="library-load" type="button" class="primary">使用所选素材</button><button id="library-save-new" type="button" class="secondary">另存当前文字</button><button id="library-save-revision" type="button" class="secondary">更新所选素材</button></div>
+  <p id="library-status" class="field-note" role="status"></p><div class="dialog-footer"><button id="library-delete" type="button" class="danger-link">删除所选素材</button></div>
+</dialog>
+<dialog id="material-delete-dialog" aria-labelledby="material-delete-title"><div class="dialog-heading"><h2 id="material-delete-title">删除所选素材</h2><button id="material-delete-close" class="quiet" type="button">关闭</button></div><p class="field-note">先选择是否保留已生成的简历，再预览受影响的记录。</p><label for="material-delete-mode">处理方式</label><select id="material-delete-mode"><option value="preserve_existing">停止复用，保留旧批次的冻结副本</option><option value="cascade">删除素材，并删除受影响的生成记录</option></select><button id="material-delete-preview" type="button" class="secondary">预览影响</button><div id="material-delete-impact" class="v2-scroll v2-reader" role="status"></div><div class="dialog-footer"><button id="material-delete-cancel" class="secondary" type="button">取消</button><button id="material-delete-confirm" class="danger" type="button" disabled>确认删除</button></div></dialog>
+<dialog id="history-dialog" aria-labelledby="history-title"><div class="dialog-heading"><h2 id="history-title">历史记录</h2><button id="close-history" class="quiet" type="button">关闭</button></div>
+  <div class="history-filters"><div><label for="history-batch">生成记录</label><select id="history-batch"></select></div><div><label for="history-kind">简历版本</label><select id="history-kind"><option value="job">求职版</option><option value="blueprint">蓝图 Plus</option></select></div></div>
+  <p id="history-note" class="field-note" role="status"></p><div id="history-list" class="v2-scroll"></div><div class="dialog-footer"><button id="history-open" class="primary" type="button">打开这次记录</button></div>
+</dialog>
+<script src="/static/v2.js" defer></script>
+</body></html>

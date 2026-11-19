@@ -58,9 +58,16 @@ def validate_configuration() -> dict[str, str]:
     _positive_setting("COACH_TIMEOUT_SECONDS", 90)
     interval = _positive_setting("COACH_WORKER_HEARTBEAT_SECONDS", 5)
     max_age = _positive_setting("COACH_WORKER_HEARTBEAT_MAX_AGE", 30)
-    _positive_setting("COACH_WORKER_STALL_SECONDS", 600)
+    stall = _positive_setting("COACH_WORKER_STALL_SECONDS", 600)
     if interval >= max_age:
         raise ConfigurationError("worker 心跳间隔必须短于健康检查过期时间")
+    # Progress and task leases are renewed between drafting, review, repair and
+    # re-review. The longest stage remains drafting (initial + correction), with
+    # 3 HTTP attempts each plus 1s/2s backoff. A stuck stage is never kept alive.
+    stage_budget = _positive_setting("COACH_TIMEOUT_SECONDS", 90) * 6 + 6
+    from app.service import LEASE_SECONDS
+    if stage_budget >= min(stall, LEASE_SECONDS):
+        raise ConfigurationError("模型超时加重试的最坏耗时必须短于 worker 停滞检测时间")
     from sqlalchemy.engine import make_url
     try:
         from app.db import database_url

@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
-from app.models import Batch
+from app.models import Batch, FactSnapshot, MaterialRevision
 
 
 class JournalUnavailable(Exception):
@@ -34,22 +34,58 @@ def _journal(*, create: bool = False):
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             yield stream
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise JournalUnavailable("Deletion journal unavailable") from error
 
 
-def _ids(stream) -> set[str]:
+def _records(stream) -> list[dict]:
+    """Read every intent or fail closed; v1 remains byte-for-byte compatible."""
+    from app.privacy_v2 import BatchDeletionIntent, MaterialDeletionIntent
+
     stream.seek(0)
-    identifiers = set()
+    records = []
+    seen: dict[tuple[str, str], dict] = {}
     for line in stream:
         record = json.loads(line)
         if not isinstance(record, dict):
             raise JournalUnavailable("Deletion journal invalid")
-        identifier = record.get("batch_id", "")
-        if record.get("version") != 1 or not re.fullmatch(r"[a-f0-9]{32}", identifier):
+        if record.get("version") == 1:
+            identifier = record.get("batch_id", "")
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
+                raise JournalUnavailable("Deletion journal invalid")
+        elif record.get("version") == 2:
+            try:
+                model = BatchDeletionIntent if record.get("resource_type") == "batch" else MaterialDeletionIntent
+                record = model.model_validate(record).model_dump(mode="json")
+            except ValueError:
+                raise JournalUnavailable("Deletion journal invalid") from None
+            identifier = record["resource_id"]
+        else:
             raise JournalUnavailable("Deletion journal invalid")
-        identifiers.add(identifier)
+        key = (record.get("resource_type", "batch"), identifier)
+        if key in seen and seen[key] != record:
+            raise JournalUnavailable("Deletion journal contains conflicting intents")
+        seen[key] = record
+        records.append(record)
+    return records
+
+
+def _ids(stream) -> set[str]:
+    identifiers = set()
+    for record in _records(stream):
+        if record["version"] == 1:
+            identifiers.add(record["batch_id"])
+        elif record["resource_type"] == "batch":
+            identifiers.add(record["resource_id"])
+        elif record["mode"] == "cascade":
+            identifiers.update(batch["resource_id"] for batch in record["affected_batches"])
     return identifiers
+
+
+def _intent_keys(stream) -> set[str]:
+    # Include the frozen graph and scope: comparing only batch IDs would permit
+    # an older archive to silently discard a newer deletion intent.
+    return {json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for r in _records(stream)}
 
 
 def _durable_file(path: Path, value: str) -> None:
@@ -88,7 +124,7 @@ def initialize_journal(session_factory=None, *, bootstrap: bool = False) -> None
             raise JournalUnavailable("Deletion journal missing")
         if session_factory:
             with session_factory() as session:
-                if session.scalar(select(Batch.id).limit(1)):
+                if any(session.scalar(select(model.id).limit(1)) for model in (Batch, FactSnapshot, MaterialRevision)):
                     raise JournalUnavailable("Existing business data requires its journal")
     with _journal(create=missing) as stream:
         _ids(stream)
@@ -130,13 +166,51 @@ def deleted_ids() -> set[str]:
 
 
 def replay_deletions(session_factory) -> int:
-    identifiers = deleted_ids()  # Missing/corrupt journal fails closed on restore.
-    with session_factory() as session:
-        rows = session.scalars(select(Batch).where(Batch.id.in_(identifiers)).with_for_update()).all() if identifiers else []
-        for row in rows:
-            session.delete(row)
-        session.commit()
-        return len(rows)
+    from app.models import FactSnapshot
+    from app.privacy_v2 import BatchDeletionIntent, MaterialDeletionIntent, DeletionPlanError, validate_replay, apply_material_intent
+
+    installation_id()
+    # Recovery must also stop all API and worker processes; this lock prevents
+    # cooperating local processes from observing or changing a partial replay.
+    with _journal() as stream:
+        records = _records(stream)
+        with session_factory() as session:
+            count = 0
+            for record in records:
+                if record["version"] == 1:
+                    row = session.scalar(select(Batch).where(Batch.id == record["batch_id"]).with_for_update())
+                    if row:
+                        if row.schema_version == 2:
+                            raise JournalUnavailable("Legacy intent cannot delete v2 data")
+                        session.delete(row)
+                        count += 1
+                elif record["resource_type"] == "material":
+                    intent = MaterialDeletionIntent.model_validate(record)
+                    try:
+                        count += sum(1 for item in intent.affected_batches if intent.mode == "cascade" and session.get(Batch, item.resource_id) is not None)
+                        apply_material_intent(session, intent)
+                    except DeletionPlanError:
+                        raise JournalUnavailable("V2 material deletion replay invalid") from None
+                else:
+                    intent = BatchDeletionIntent.model_validate(record)
+                    try:
+                        snapshot_ids = validate_replay(session, intent)
+                    except DeletionPlanError:
+                        raise JournalUnavailable("V2 deletion replay invalid") from None
+                    row = session.get(Batch, intent.resource_id)
+                    if row:
+                        session.delete(row)
+                        count += 1
+                    for snapshot_id in snapshot_ids:
+                        snapshot = session.get(FactSnapshot, snapshot_id)
+                        if snapshot:
+                            session.delete(snapshot)
+                    for material_id in intent.owned_material_revision_ids:
+                        material = session.get(MaterialRevision, material_id)
+                        if material:
+                            session.delete(material)
+            session.commit()
+            return count
 
 
 def delete_batch(session_factory, identifier: str) -> None:
@@ -147,9 +221,12 @@ def delete_batch(session_factory, identifier: str) -> None:
         identifiers = _ids(stream)
         if identifier not in identifiers:
             with session_factory() as session:
-                if session.get(Batch, identifier) is None:
+                batch = session.get(Batch, identifier)
+                if batch is None:
                     from app.service import NotFound
                     raise NotFound()
+                if batch.schema_version == 2:
+                    raise JournalUnavailable("Use v2 deletion protocol")
             if not re.fullmatch(r"[a-f0-9]{32}", identifier):
                 raise ValueError("invalid batch id")
             stream.seek(0, os.SEEK_END)
@@ -159,5 +236,7 @@ def delete_batch(session_factory, identifier: str) -> None:
         with session_factory() as session:
             row = session.scalar(select(Batch).where(Batch.id == identifier).with_for_update())
             if row:
+                if row.schema_version == 2:
+                    raise JournalUnavailable("Use v2 deletion protocol")
                 session.delete(row)
             session.commit()

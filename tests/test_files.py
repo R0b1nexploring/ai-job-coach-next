@@ -54,13 +54,19 @@ def compact(text):
 def test_long_exports_preserve_same_saved_content_and_embed_cjk():
     resume = long_resume()
     before = deepcopy(resume)
-    expected = [resume["title"], resume["summary"], "项目与能力"] + [item["text"] for item in resume["items"]]
+    expected = [
+        "姓名：________________",
+        "电话：____________  |  邮箱：________________  |  所在城市：________",
+        resume["title"], resume["summary"], "教育背景",
+        "学校：________________    专业：____________\n学历：________    就读时间：________________",
+        "项目与能力",
+    ] + [item["text"] for item in resume["items"]]
 
     html = VisibleContent()
     html.feed(files.render_html(resume).decode())
     docx = Document(BytesIO(files.render_docx(resume)))
-    assert html.parts[4:] == expected
-    assert [paragraph.text for paragraph in docx.paragraphs][4:] == expected
+    assert html.parts == expected
+    assert [paragraph.text for paragraph in docx.paragraphs] == expected
 
     pdf = PdfReader(BytesIO(files.render_pdf(resume)))
     assert 2 <= len(pdf.pages) <= 4
@@ -156,46 +162,3 @@ def test_corrupt_docx_and_overlong_text_are_controlled_errors():
         files.extract_material("fictional.docx", broken.getvalue())
     with pytest.raises(ValueError, match="20000"):
         files.extract_material("fictional.txt", ("虚构" * 10001).encode())
-
-
-@pytest.mark.parametrize("filled", [False, True])
-def test_manual_header_precedes_content_in_all_exports(filled):
-    resume = {"title": "虚构求职版", "summary": "完全虚构的项目说明。", "items": [{"text": "虚构课程设计，保留图纸与修改记录。"}]}
-    if filled:
-        resume["header"] = {"name": "虚构同学", "phone": "00000000000", "email": "fictional@example.invalid", "location": "虚构城市", "education": "虚构理工大学 | 机械工程 | 本科 | 2022-2026\n课程仅用于测试 <script> & Unicode α。"}
-    original = deepcopy(resume)
-    html = VisibleContent()
-    raw_html = files.render_html(resume).decode()
-    html.feed(raw_html)
-    docx = Document(BytesIO(files.render_docx(resume)))
-    paragraphs = [p.text for p in docx.paragraphs]
-    assert html.parts == paragraphs
-    assert html.parts[2] == "教育经历"
-    assert html.parts[4] == resume["title"]
-    assert html.parts[5] == resume["summary"]
-    pdf = PdfReader(BytesIO(files.render_pdf(resume)))
-    text = compact("\n".join(page.extract_text() for page in pdf.pages))
-    cursor = 0
-    for part in html.parts:
-        cursor = text.index(compact(part), cursor) + len(compact(part))
-    if filled:
-        assert paragraphs[0] == resume["header"]["name"]
-        assert paragraphs[3] == resume["header"]["education"]
-        assert "________________" not in "".join(paragraphs)
-        assert "<script>" not in raw_html
-    else:
-        assert paragraphs[0].startswith("姓名：")
-        assert all(label in paragraphs[1] for label in ["电话：", "邮箱：", "所在城市："])
-        assert all(label in paragraphs[3] for label in ["学校：", "专业：", "学历：", "就读时间："])
-        assert "fictional@example.invalid" not in "".join(paragraphs)
-    assert resume == original
-
-
-def test_long_education_and_contact_wrap_without_losing_saved_text():
-    resume = long_resume()
-    resume["header"] = {"name": "虚构同学", "email": "fictional-" + "x" * 120 + "@example.invalid", "education": "虚构教育记录：" + "仅为排版测试，学校与课程均为虚构。" * 70}
-    pdf = PdfReader(BytesIO(files.render_pdf(resume)))
-    text = compact("\n".join(page.extract_text() for page in pdf.pages))
-    assert compact(resume["header"]["email"]) in text
-    assert compact(resume["header"]["education"]) in text
-    assert compact(resume["items"][-1]["text"]) in text

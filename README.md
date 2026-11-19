@@ -2,16 +2,29 @@
 
 An independent rewrite of AI Job Coach for preparing a job-specific resume, a skills blueprint, supporting guides, and exports from user-selected material.
 
+The V2 workbench takes one target job description and optional source material. It lets you confirm facts, generate a job resume and a learning blueprint with their own interview guides, review revision history, and download drafts.
+
 ## Requirements
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
+- Node.js for development checks
 - Docker Compose is optional
 
-## Local development
+## Try the V2 workbench
 
 ```sh
-cp .env.example .env
+uv sync --locked --python 3.12
+uv run --locked --no-sync python scripts/start_v2_preview.py
+```
+
+Open [the local workbench](http://127.0.0.1:18849/v2). The preview starts its own background worker, uses an isolated SQLite database under `data/v2-preview/`, and runs a local demo model that requires no API key. Use fictional material when trying the workflow.
+
+V2 supports draft HTML and DOCX exports. V2 PDF and the PDF-inclusive bundle require the pinned macOS LibreOffice runtime used by the preview. The bundled CJK font carries its own license.
+
+## Run the original workbench
+
+```sh
 uv sync --locked --python 3.12
 uv run --locked --no-sync alembic upgrade head
 uv run --locked --no-sync uvicorn app.api:app --host 127.0.0.1 --port 8827
@@ -23,6 +36,10 @@ The local provider is the default and needs no external API key. The development
 uv run --locked --no-sync python -m app.worker
 ```
 
+For the personal Docker installation of the original workbench, run `./scripts/coach.sh init` followed by `./scripts/coach.sh up`. For an existing installation, stop its writers and back up its database and deletion journal before applying migrations. The upgrade reconciles both historical layouts with Alembic revision `0004`.
+
+## Checks
+
 Run the offline development checks with:
 
 ```sh
@@ -33,10 +50,10 @@ The check validates repository boundaries, the dependency lock, unit tests, brow
 
 ## Privacy and configuration
 
-Use only documents you are authorized to process. Keep real resumes, generated exports, databases, environment files, and service credentials out of version control. `.env.example` contains blank development settings; copy it to `.env` and add credentials only to your local ignored file if you intentionally configure an external provider.
+Use only documents you are authorized to process. Keep real resumes, generated exports, databases, environment files, and service credentials out of version control. See `.env.example` for environment variable names when configuring an external provider.
 
 This project is an independent rewrite. The older `ai-job-coach` project and its history are not part of this repository.
 
 ## License
 
-The root MIT license covers project code authored for this repository. It does not grant rights to third-party materials or user-provided resume content.
+The root MIT license covers project code authored for this repository. See [Content and rights](CONTENT-NOTICES.md) for the separate font license and content terms.

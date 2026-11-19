@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
+import subprocess
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -32,7 +34,9 @@ def test_dual_resume_guides_and_provenance(sessions):
     assert set(after_resumes["resumes"]) == {"job", "blueprint"}
     assert after_resumes["resumes"]["job"]["items"][0]["source_status"] == "user_confirmed"
     assert after_resumes["resumes"]["job"]["items"][0]["verification_status"] == "ai_generated"
+    # 素材确认只覆盖引用原文，不能替模型扩写的整条正文确认完成。
     assert after_resumes["resumes"]["job"]["items"][0]["achieved"] is False
+    assert after_resumes["resumes"]["job"]["items"][0]["flags"] == ["achievement_unverified"]
     assert after_resumes["resumes"]["blueprint"]["items"][0]["verification_status"] == "ai_generated"
     assert after_resumes["resumes"]["blueprint"]["items"][0]["achieved"] is False
     assert process_guide_once(sessions, provider)
@@ -43,6 +47,26 @@ def test_dual_resume_guides_and_provenance(sessions):
         assert result["guides"][kind]["status"] == "ready"
         assert result["guides"][kind]["entries"][0]["item_id"] == result["resumes"][kind]["items"][0]["id"]
     assert result["resumes"]["job"]["items"][0]["text"] != result["resumes"]["blueprint"]["items"][0]["text"]
+
+
+@pytest.mark.parametrize("kind", ["job", "blueprint"])
+def test_generated_item_can_be_completed_by_explicit_user_confirmation(sessions, kind):
+    from app.service import get_resume_revision, save_resume
+
+    batch = create_batch(sessions, jd=JD, material=MATERIAL, confirmed=True, idempotency_key=f"confirm-{kind}")
+    assert process_batch_once(sessions, LocalProvider())
+    before = get_batch(sessions, batch.id)["resumes"][kind]
+    assert before["items"][0]["achieved"] is False
+    assert before["items"][0]["verification_status"] == "ai_generated"
+    items = [dict(item, confirm=True, achieved=True) for item in before["items"]]
+    after = save_resume(
+        sessions, batch.id, kind, revision=before["revision"],
+        title=before["title"], summary=before["summary"], items=items,
+    )["resumes"][kind]
+    assert after["items"][0]["text"] == before["items"][0]["text"]
+    assert after["items"][0]["achieved"] is True
+    assert after["items"][0]["verification_status"] == "user_confirmed"
+    assert get_resume_revision(sessions, batch.id, kind, 1)["items"][0]["achieved"] is False
 
 
 def test_duplicate_request_reuses_batch_and_changed_input_conflicts(sessions):
@@ -75,7 +99,7 @@ def test_guide_failure_is_independent_and_retryable(sessions):
     assert get_batch(sessions, batch.id)["status"] == "ready"
 
 
-def test_expired_claim_recovers_and_semantic_failure_falls_back(sessions):
+def test_expired_claim_recovers_and_semantic_failure_falls_back(sessions, caplog):
     class WrongReference(LocalProvider):
         name = "wrong-reference"
         def bundle(self, jd, material):
@@ -94,8 +118,29 @@ def test_expired_claim_recovers_and_semantic_failure_falls_back(sessions):
     result = get_batch(sessions, batch.id)
     assert result["status"] == "guides_pending"
     assert result["source"] == "degraded_local"
+    assert "provider fallback operation=bundle category=normalized_output_rejected http_status=-" in caplog.text
     with sessions() as session:
         assert session.get(Batch, batch.id).attempts == 2
+
+
+def test_guide_normalization_fallback_is_logged_without_payload(sessions, caplog):
+    class WrongGuideReference(LocalProvider):
+        name = "fictional-compatible-guide"
+        def guide(self, kind, resume, plans, jd):
+            raw = super().guide(kind, resume, plans, jd)
+            raw["entries"][0]["item_index"] = 42
+            return raw
+
+    batch = create_batch(sessions, jd=JD, material="", confirmed=False, idempotency_key="guide-normalization-log")
+    assert process_batch_once(sessions, LocalProvider())
+    assert process_guide_once(sessions, FallbackProvider(WrongGuideReference()))
+    result = get_batch(sessions, batch.id)
+    assert result["guides"]["job"]["status"] == "ready"
+    assert result["guides"]["job"]["source"] == "degraded_local"
+    assert "provider fallback operation=guide:job category=normalized_output_rejected http_status=-" in caplog.text
+    filtered = subprocess.run(["awk", "-f", str(Path(__file__).parents[1] / "scripts" / "provider-diagnostic-filter.awk")], input=caplog.text, text=True, capture_output=True, check=True).stdout
+    assert "provider_error operation=guide:job category=normalized_output_rejected http_status=- count=1" in filtered
+    assert "42" not in filtered
 
 
 def test_guide_step_arrays_normalize_to_display_text():

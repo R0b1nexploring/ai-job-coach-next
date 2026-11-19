@@ -67,6 +67,7 @@ def main() -> int:
         run("dependency lock", ["uv", "lock", "--check"], env)
         run("offline tests", [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], env)
         run("browser JavaScript syntax", ["node", "--check", "app/static/app.js"], env)
+        run("v2 browser JavaScript syntax", ["node", "--check", "app/static/v2.js"], env)
         run("empty and historical temporary SQLite migrations", [sys.executable, "scripts/check_migrations.py"], env)
     except (subprocess.CalledProcessError, OSError, RuntimeError) as error:
         print(f"[failed] {error}", file=sys.stderr)

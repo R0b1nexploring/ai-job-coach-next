@@ -1,74 +1,100 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>双版本简历工作台</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light">
+  <title>双版本简历工作台</title><link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
-  <div class="shell">
-    <aside class="app-navigation">
-      <div class="brand"><span class="brand-mark">简</span><span>求职工作台</span></div>
-      <p class="nav-caption">主要功能</p>
-      <nav aria-label="页面导航"><a class="nav-link active" href="#input-heading">简历工作台</a><a class="nav-link" href="#result-heading">面试指南</a><a class="nav-link" href="#batch-history">历史记录</a></nav>
-      <div class="sidebar-note">独立重写 · 个人本机版<br><span id="provider-note">正在检查模型配置…</span></div>
-    </aside>
-    <main>
-      <section class="hero">
-        <div class="eyebrow">简历工作台 / 双版本生成</div>
-        <h1>把岗位要求，变成可准备的简历。</h1>
-        <p>从一份岗位描述开始，生成求职版、蓝图 Plus 和各自对应的面试指南。</p>
-      </section>
-      <div class="workspace">
-        <section class="panel input-panel" aria-labelledby="input-heading">
-          <div class="section-heading"><span class="step">01</span><div><h2 id="input-heading">准备输入</h2><p>先从一份明确的 JD 开始</p></div></div>
-          <form id="generator-form">
-            <label for="jd">岗位描述 <span class="required">必填</span></label>
-            <textarea id="jd" name="jd" required minlength="20" maxlength="15000" placeholder="粘贴岗位职责、任职要求和你关注的方向。建议保留原文。"></textarea>
-            <div class="field-caption"><span>要求会从这段文字中提取</span><span id="jd-count">0 / 15000</span></div>
-            <label for="material">个人素材 <span class="optional">可选</span></label>
-            <input id="material-file" type="file" accept=".docx,.pdf,.txt">
-            <span id="upload-status" class="field-caption">上传后会提取文字供你核对，不会自动标为已确认。</span>
-            <textarea id="material" name="material" maxlength="20000" placeholder="可写课程项目、实习、科研、竞赛或技能。没有素材也可以先生成项目规划草稿。"></textarea>
-            <div class="field-caption"><span>可手工修改提取后的文字</span><span id="material-count">0 / 20000</span></div>
-            <label class="checkbox-row"><input type="checkbox" id="confirmed"><span>我已核对上方素材，内容是我真实做过或取得的</span></label>
-            <button class="primary" id="generate" type="submit">生成双版本与指南 <span aria-hidden="true">↗</span></button>
-            <p class="form-note">AI 补充保留待核验状态，不会自动变成已确认事实。本版限个人本机使用。</p>
-          </form>
+<body data-layout="three">
+  <a class="skip-link" href="#screen-title">跳到当前步骤</a>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">简</span><span>求职工作台</span></div>
+      <span id="provider-note" class="provider-note">正在检查模型配置…</span>
+      <div class="header-actions"><button id="open-history" class="quiet" type="button">历史记录</button><button id="new-task" class="quiet" type="button">新建</button></div>
+    </header>
+    <nav class="step-track" aria-label="简历准备步骤">
+      <button data-step="0" aria-current="step"><span>1</span>岗位</button><button data-step="1"><span>2</span>素材</button><button data-step="2"><span>3</span>个人信息</button><button data-step="3"><span>4</span>确认生成</button><button data-step="4" disabled><span>5</span>核对简历</button><button data-step="5" disabled><span>6</span>面试准备</button><button data-step="6" disabled><span>7</span>导出</button>
+    </nav>
+    <main id="workspace">
+      <div class="screen-heading"><div class="screen-intro"><p id="step-label" class="eyebrow">第 1 步 / 共 7 步</p><h1 id="screen-title" tabindex="-1">先放入你想申请的岗位</h1><p id="screen-description">粘贴完整岗位描述，保留职责与任职要求。</p></div><div class="screen-utilities"><div class="column-shortcuts"><button id="open-context" class="secondary" type="button" aria-haspopup="dialog" aria-controls="context-dialog">本次资料</button><button id="open-support" class="secondary" type="button" aria-haspopup="dialog" aria-controls="support-dialog">关联信息</button></div><div id="version-tabs" class="version-switch" role="group" aria-label="简历版本" hidden><button class="tab active" data-kind="job" aria-pressed="true" type="button">求职版</button><button class="tab" data-kind="blueprint" aria-pressed="false" type="button">蓝图 Plus</button></div></div></div>
+      <div id="status" class="status" role="status" hidden></div>
+      <div class="workspace-columns">
+        <aside id="context-column" class="info-column context-column" aria-labelledby="context-heading">
+          <div class="column-heading"><span class="small-label">资料参考</span><h2 id="context-heading">本次资料</h2></div>
+          <div id="context-summary" class="summary-facts"><p class="field-note">填写岗位和素材后，可在这里随时对照原文。</p></div>
+          <div class="column-control"><label for="context-source-select">查看原始资料</label><select id="context-source-select"><option value="jd">岗位描述</option><option value="material">个人素材</option></select></div>
+          <div id="context-reader" class="reader sidebar-reader"><p class="field-note">岗位描述将在这里显示。</p></div>
+        </aside>
+        <div class="stage-column">
+      <form id="generator-form" novalidate>
+        <section class="step-screen source-screen" data-screen="0" aria-labelledby="screen-title">
+          <div class="field-heading"><label for="jd">岗位描述 <span class="required">必填</span></label><span id="jd-count" class="counter">0 / 15000</span></div>
+          <textarea id="jd" name="jd" required minlength="20" maxlength="15000" aria-describedby="jd-help" placeholder="粘贴岗位职责、任职要求和你关注的方向。建议保留原文。"></textarea>
+          <p id="jd-help" class="field-note">至少 20 字。个人素材与联系方式会在后续步骤单独填写。</p>
         </section>
-        <section class="panel result-panel" aria-labelledby="result-heading">
-          <div class="section-heading"><span class="step">02</span><div><h2 id="result-heading">查看成果</h2><p>两份简历与各自的准备指南</p></div></div>
-          <div id="status" class="status" role="status">尚未生成。完成左侧输入后即可开始。</div>
-          <button id="retry-batch" class="secondary" type="button" hidden>重试生成</button>
-          <label for="batch-history">最近生成记录</label><select id="batch-history"><option value="">选择记录</option></select>
-          <div id="results" hidden>
-            <div class="tabs" role="tablist" aria-label="简历版本">
-              <button type="button" class="tab active" data-kind="job" role="tab" aria-selected="true">求职版</button>
-              <button type="button" class="tab" data-kind="blueprint" role="tab" aria-selected="false">蓝图 Plus</button>
-            </div>
-            <div id="resume" class="resume-card"></div>
-            <div class="result-actions"><button id="edit-resume" class="secondary" type="button">编辑本版</button><a id="download-html" href="#">HTML</a><a id="download-docx" href="#">DOCX</a><a id="download-pdf" href="#">PDF</a></div>
-            <form id="editor" hidden>
-              <fieldset class="header-fields"><legend>个人信息与教育经历</legend><p class="form-note">按自己的实际情况填写；未填写的位置会保留为空白区。</p>
-                <div class="header-input-grid"><div><label for="edit-name">姓名</label><input id="edit-name" data-header="name" maxlength="80" autocomplete="name"></div><div><label for="edit-phone">电话</label><input id="edit-phone" data-header="phone" maxlength="40" autocomplete="tel"></div><div><label for="edit-email">邮箱</label><input id="edit-email" data-header="email" maxlength="160" autocomplete="email"></div><div><label for="edit-location">所在城市</label><input id="edit-location" data-header="location" maxlength="80" autocomplete="address-level2"></div></div>
-                <label for="edit-education">教育经历</label><textarea id="edit-education" data-header="education" maxlength="1500" placeholder="学校、专业、学历、就读时间；可按行填写多段教育经历。"></textarea>
-              </fieldset>
-              <label for="edit-title">标题</label><input id="edit-title" maxlength="160"><label for="edit-summary">简介</label><textarea id="edit-summary" maxlength="1000"></textarea><div id="edit-items"></div><button id="add-item" class="secondary" type="button">增加要点</button><details><summary>编辑本版项目方案</summary><p class="form-note">方案与正文一起保存；更新后的指南将使用本版方案。</p><div id="edit-plans"></div></details><div class="result-actions"><button class="primary" type="submit">保存新版</button><button id="cancel-edit" class="secondary" type="button">取消</button></div><p id="edit-status" role="status"></p></form>
-            <details><summary>本版修订与指南历史</summary><div id="revision-history"></div></details>
-            <div class="guide-heading"><div><span class="small-label">面试准备</span><h3 id="guide-title">对应面试指南</h3></div><span id="guide-status" class="guide-badge"></span></div>
-            <a id="download-guide" class="guide-download" href="#" hidden>下载这份指南</a>
-            <div id="guide" class="guide-list"></div>
-            <button id="retry-guide" class="secondary" type="button" hidden>重试这份指南</button>
-            <div class="result-actions"><a id="download-data" href="#">导出本次全部资料</a><button id="delete-batch" class="secondary" type="button">删除本次资料</button></div>
-            <div id="delete-options" hidden><p>删除两版简历、指南和所有历史。后续恢复旧备份也会保留本次删除。</p><button id="confirm-delete" class="secondary" type="button">确定删除本次资料</button><button id="cancel-delete" class="secondary" type="button">保留资料</button></div>
-          </div>
+        <section class="step-screen source-screen" data-screen="1" hidden aria-labelledby="screen-title">
+          <div class="upload-row"><label for="material-file">上传素材 <span class="optional">可选</span></label><input id="material-file" type="file" accept=".docx,.pdf,.txt"></div>
+          <p id="upload-status" class="field-note" role="status">支持 PDF、Word、TXT。提取后请核对，不会自动确认事实。</p>
+          <div class="field-heading"><label for="material">个人素材</label><span id="material-count" class="counter">0 / 20000</span></div>
+          <textarea id="material" name="material" maxlength="20000" placeholder="可写课程项目、实习、科研、竞赛或技能。没有素材可以直接进入下一步。"></textarea>
+          <label class="checkbox-row"><input type="checkbox" id="confirmed"><span>我已核对素材，内容是我真实做过或取得的</span></label>
+        </section>
+        <section class="step-screen" data-screen="2" hidden aria-labelledby="screen-title">
+          <fieldset class="personal-fields"><legend>两版简历的初始个人信息 <span class="optional">可选</span></legend>
+            <div class="header-input-grid"><div><label for="pf-name">姓名</label><input id="pf-name" maxlength="80" autocomplete="off"></div><div><label for="pf-phone">电话</label><input id="pf-phone" maxlength="50" autocomplete="off"></div><div><label for="pf-email">邮箱</label><input id="pf-email" maxlength="160" autocomplete="off"></div><div><label for="pf-location">所在城市</label><input id="pf-location" maxlength="100" autocomplete="off"></div></div>
+            <div class="education-field"><label for="pf-education">教育背景</label><textarea id="pf-education" maxlength="1500" placeholder="学校、专业、学历与就读时间；可按行填写。"></textarea></div>
+          </fieldset><p class="field-note">个人信息不会发给模型。生成后可分别修改两版；未填的位置保留空白填写区。</p>
+        </section>
+        <section class="step-screen generation-screen" data-screen="3" hidden aria-labelledby="screen-title">
+          <div id="input-review" class="input-review"></div>
+          <div class="generation-callout"><span class="generation-mark" aria-hidden="true">✳</span><h2 id="generation-title">生成两份可核对的草稿</h2><p id="generation-note">求职版整理现有素材；蓝图 Plus 提供尚未完成的项目规划。每版都会配一份面试指南。</p><button class="primary" id="generate" type="submit">开始生成双版本</button><button id="retry-batch" class="secondary" type="button" hidden>重试这次生成</button><p class="field-note">AI 补充仍需核验，不会自动成为已确认事实。</p></div>
+        </section>
+      </form>
+      <div id="results" hidden>
+        <section class="step-screen result-screen" data-screen="4" hidden aria-labelledby="screen-title">
+          <div class="pane-toolbar"><label for="resume-section">当前章节</label><select id="resume-section"></select><button id="edit-resume" class="secondary" type="button">编辑本版</button></div>
+          <div id="resume" class="reader" aria-live="off"></div>
+        </section>
+        <section class="step-screen result-screen" data-screen="5" hidden aria-labelledby="screen-title">
+          <div class="pane-toolbar guide-toolbar"><label for="guide-entry">对应要点</label><select id="guide-entry"></select><span id="guide-status" class="guide-badge"></span></div>
+          <div class="facet-tabs" id="guide-facets" role="group" aria-label="指南内容"><button data-facet="question" aria-pressed="true" type="button">问题</button><button data-facet="answer_outline" aria-pressed="false" type="button">回答</button><button data-facet="contribution_boundary" aria-pressed="false" type="button">贡献</button><button data-facet="verification" aria-pressed="false" type="button">核验</button><button data-facet="practice_step" aria-pressed="false" type="button">准备</button></div>
+          <div id="guide" class="reader"></div><button id="retry-guide" class="secondary" type="button" hidden>重试这份指南</button>
+        </section>
+        <section class="step-screen export-screen" data-screen="6" hidden aria-labelledby="screen-title">
+          <div class="export-intro"><span class="small-label" id="export-kind">求职版</span><h2>将准备好的内容带走</h2><p id="export-description">导出当前版本的简历，保留个人信息、要点与当前修订。</p></div>
+          <div class="export-group"><h3>本版简历</h3><div class="format-links"><a id="download-pdf" href="#">PDF <span>适合阅读与打印</span></a><a id="download-docx" href="#">Word <span>继续修改排版</span></a><a id="download-html" href="#">HTML <span>浏览器阅读</span></a></div></div>
+          <div class="export-bottom"><div><h3 id="guide-title">对应面试指南</h3><a id="download-guide" class="secondary link-button" href="#" hidden>下载这份指南</a><p id="export-guide-note" class="field-note"></p></div><div><h3>整次资料</h3><a id="download-data" class="secondary link-button" href="#">导出全部资料</a></div></div>
+          <button id="delete-batch" class="danger-link" type="button">删除本次资料</button>
         </section>
       </div>
+        </div>
+        <aside id="support-column" class="info-column support-column" aria-labelledby="support-heading">
+          <div class="column-heading"><span class="small-label">当前步骤</span><h2 id="support-heading">关联信息</h2></div>
+          <div class="column-control"><label for="support-topic">查看关联内容</label><select id="support-topic"><option value="help">填写提示</option></select></div>
+          <div id="support-reader" class="reader sidebar-reader"><p class="field-note">当前步骤的说明与对应内容将在这里显示。</p></div>
+          <button id="support-action" class="secondary" type="button" hidden>查看关联内容</button>
+        </aside>
+      </div>
     </main>
-    <footer>个人本机版 · 双版本简历与面试指南 · AI 稿件需由你核对</footer>
+    <footer class="step-footer"><button id="step-prev" class="secondary" type="button" disabled>上一步</button><span id="footer-hint">填写这一页后，点击下一步。</span><button id="step-next" class="primary" type="button">下一步 <span aria-hidden="true">→</span></button></footer>
   </div>
+  <dialog id="context-dialog" class="column-dialog" aria-labelledby="context-dialog-heading"><div class="dialog-heading"><h2 id="context-dialog-heading">本次资料</h2><button id="close-context" class="quiet" type="button">关闭</button></div><div id="context-slot" class="column-slot"></div></dialog>
+  <dialog id="support-dialog" class="column-dialog" aria-labelledby="support-dialog-heading"><div class="dialog-heading"><h2 id="support-dialog-heading">关联信息</h2><button id="close-support" class="quiet" type="button">关闭</button></div><div id="support-slot" class="column-slot"></div></dialog>
+  <dialog id="editor-dialog" aria-labelledby="edit-heading">
+    <form id="editor" novalidate>
+      <div class="dialog-heading"><div><p class="eyebrow" id="edit-kind">编辑求职版</p><h2 id="edit-heading">修改当前版本</h2></div><button id="cancel-edit-top" class="quiet" type="button" aria-label="取消编辑">关闭</button></div>
+      <div id="edit-status" class="field-note" role="status"></div>
+      <div class="pane-toolbar"><label for="edit-section">编辑内容</label><select id="edit-section"><option value="header">个人信息</option><option value="summary">标题与简介</option><option value="items">项目要点</option><option value="plans">项目方案</option></select></div>
+      <section data-edit-pane="header" class="editor-pane personal-fields"><div class="header-input-grid"><div><label for="edit-name">姓名</label><input id="edit-name" data-header="name" maxlength="80" autocomplete="off"></div><div><label for="edit-phone">电话</label><input id="edit-phone" data-header="phone" maxlength="50" autocomplete="off"></div><div><label for="edit-email">邮箱</label><input id="edit-email" data-header="email" maxlength="160" autocomplete="off"></div><div><label for="edit-location">所在城市</label><input id="edit-location" data-header="location" maxlength="100" autocomplete="off"></div></div><div class="education-field"><label for="edit-education">教育背景</label><textarea id="edit-education" data-header="education" maxlength="1500" placeholder="可留空，导出时保留填写区。"></textarea></div><p class="field-note">只改个人信息不会让指南过期。其他版本与历史保留各自信息。</p></section>
+      <section data-edit-pane="summary" class="editor-pane" hidden><label for="edit-title">标题</label><input id="edit-title" maxlength="160" minlength="2"><label for="edit-summary">简介</label><textarea id="edit-summary" maxlength="1000" minlength="4"></textarea></section>
+      <section data-edit-pane="items" class="editor-pane" hidden><div class="pane-toolbar"><label for="edit-item-select">当前要点</label><select id="edit-item-select"></select><button id="add-item" class="secondary" type="button">增加要点</button></div><div id="edit-items"></div></section>
+      <section data-edit-pane="plans" class="editor-pane" hidden><div class="plan-selectors"><div><label for="edit-plan-select">当前项目</label><select id="edit-plan-select"></select></div><div><label for="edit-plan-field">当前字段</label><select id="edit-plan-field"><option value="title">项目名称</option><option value="background">背景与限制</option><option value="task">本人任务</option><option value="actions">方法与步骤</option><option value="outcome">成果或预期产物</option><option value="verification">核验方法</option></select></div></div><div id="edit-plans"></div></section>
+      <div class="dialog-footer"><button id="cancel-edit" class="secondary" type="button">取消</button><button id="edit-pane-prev" class="secondary" type="button">上一项</button><button id="edit-pane-next" class="secondary" type="button">下一项</button><button id="save-edit" class="primary" type="submit">保存新版</button></div>
+    </form>
+  </dialog>
+  <dialog id="history-dialog" aria-labelledby="history-heading"><div class="dialog-heading"><div><p class="eyebrow">可返回任一次生成与修订</p><h2 id="history-heading">历史记录</h2></div><button id="close-history" class="quiet" type="button">关闭</button></div><label for="batch-history">生成记录</label><select id="batch-history"><option value="">选择记录</option></select><div class="history-selectors"><div><label for="history-kind">版本</label><select id="history-kind"><option value="job">求职版</option><option value="blueprint">蓝图 Plus</option></select></div><div><label for="history-type">资料</label><select id="history-type"><option value="resume">简历修订</option><option value="guide">指南修订</option></select></div><div><label for="history-revision">修订</label><select id="history-revision"></select></div></div><div class="pane-toolbar"><label for="history-section">查看内容</label><select id="history-section"></select></div><div id="revision-history" class="reader"></div><div id="history-downloads" class="format-links compact"></div><div class="dialog-footer"><button id="return-record" class="primary" type="button">回到这次成果</button></div></dialog>
+  <dialog id="delete-dialog" aria-labelledby="delete-heading"><h2 id="delete-heading">删除本次资料？</h2><p>将删除两版简历、指南与全部历史修订。恢复旧备份也会保留本次删除。</p><p id="delete-status" class="field-note" role="status"></p><div class="dialog-footer"><button id="cancel-delete" class="secondary" type="button">保留资料</button><button id="confirm-delete" class="danger" type="button">确定删除</button></div></dialog>
+  <dialog id="blueprint-dialog" aria-labelledby="blueprint-heading"><h2 id="blueprint-heading">导出蓝图 Plus</h2><p>蓝图 Plus 包含尚未完成的项目规划。导出仅供学习与准备参考，不能作为已核实简历投递。</p><div class="dialog-footer"><button id="cancel-blueprint" class="secondary" type="button">取消</button><a id="confirm-blueprint" class="primary link-button" href="#" download>确认用于准备并导出</a></div></dialog>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

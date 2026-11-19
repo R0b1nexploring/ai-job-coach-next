@@ -3,18 +3,50 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
+import logging
 from typing import Callable
 
 from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.content import normalize_bundle, normalize_guide, stable_hash
+from app.content import KNOWN_ITEM_FLAGS, gap_phrases, normalize_bundle, normalize_guide, stable_hash, unverified_numbers
+from app.content_review import ContentReviewBlocked, review_bundle
 from app.models import Batch, Guide, GuideRevision, Resume, ResumeRevision, TaskExecution, new_id, utcnow
 from app.providers import FallbackProvider, LocalProvider, Provider
 
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = 900
+logger = logging.getLogger(__name__)
+
+_PROFILE_FIELDS = {"name": 80, "phone": 50, "email": 160, "location": 100, "education": 1500}
+
+
+def validate_profile(data: dict | None) -> dict:
+    """Normalize the optional identity block; empty fields are omitted entirely."""
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("invalid profile")
+    unknown = set(data) - set(_PROFILE_FIELDS)
+    if unknown:
+        raise ValueError("invalid profile")
+    profile = {}
+    for field, limit in _PROFILE_FIELDS.items():
+        value = data.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError("invalid profile")
+        if field != "education" and ("\r" in value or "\n" in value):
+            raise ValueError("single-line profile field required")
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        value = value.strip()
+        if value:
+            if len(value) > limit:
+                raise ValueError("invalid profile")
+            profile[field] = value
+    return profile
 
 
 class InputConflict(Exception):
@@ -23,6 +55,55 @@ class InputConflict(Exception):
 
 class NotFound(Exception):
     pass
+
+
+class ClientUpgradeRequired(Exception):
+    """A v1 caller cannot safely read or mutate this schema version."""
+
+
+def _v1_column(column):
+    return or_(column.is_(None), column == 1)
+
+
+def _require_v1(row) -> None:
+    if row is not None and row.schema_version not in (None, 1):
+        raise ClientUpgradeRequired()
+
+
+def _require_current_v1(session: Session, batch: Batch) -> None:
+    _require_v1(batch)
+    resumes = session.scalars(select(Resume).where(Resume.batch_id == batch.id)).all()
+    guides = session.scalars(select(Guide).where(Guide.batch_id == batch.id)).all()
+    for row in [*resumes, *guides]:
+        _require_v1(row)
+    for resume in resumes:
+        revision = session.scalar(select(ResumeRevision).where(ResumeRevision.resume_id == resume.id, ResumeRevision.revision == resume.revision))
+        _require_v1(revision)
+    for guide in guides:
+        revision = session.scalar(select(GuideRevision).where(GuideRevision.guide_id == guide.id, GuideRevision.revision == guide.revision))
+        _require_v1(revision)
+
+
+def _batch_v1_safe():
+    return and_(
+        _v1_column(Batch.schema_version),
+        ~exists(select(Resume.id).where(Resume.batch_id == Batch.id, ~_v1_column(Resume.schema_version)).correlate(Batch)),
+        ~exists(select(Guide.id).where(Guide.batch_id == Batch.id, ~_v1_column(Guide.schema_version)).correlate(Batch)),
+        ~exists(select(ResumeRevision.id).join(Resume, Resume.id == ResumeRevision.resume_id).where(
+            Resume.batch_id == Batch.id, Resume.revision == ResumeRevision.revision, ~_v1_column(ResumeRevision.schema_version)).correlate(Batch)),
+        ~exists(select(GuideRevision.id).join(Guide, Guide.id == GuideRevision.guide_id).where(
+            Guide.batch_id == Batch.id, Guide.revision == GuideRevision.revision, ~_v1_column(GuideRevision.schema_version)).correlate(Batch)),
+    )
+
+
+def _guide_v1_safe():
+    return and_(
+        _v1_column(Guide.schema_version),
+        exists(select(Batch.id).where(Batch.id == Guide.batch_id, _batch_v1_safe()).correlate(Guide)),
+        exists(select(Resume.id).where(Resume.id == Guide.resume_id, _v1_column(Resume.schema_version)).correlate(Guide)),
+        exists(select(GuideRevision.id).where(GuideRevision.guide_id == Guide.id,
+            GuideRevision.revision == Guide.revision, _v1_column(GuideRevision.schema_version)).correlate(Guide)),
+    )
 
 
 @dataclass(frozen=True)
@@ -41,42 +122,20 @@ def semantic_hash(data: dict, plans: list[dict], jd: str) -> str:
 
 
 def _resume_data(resume: Resume) -> dict:
-    return {"title": resume.title, "summary": resume.summary, "header": deepcopy(resume.header), "items": deepcopy(resume.items)}
-
-
-_HEADER_LIMITS = {"name": 80, "phone": 40, "email": 160, "location": 80, "education": 1500}
-
-
-def _clean_header(header: dict) -> dict[str, str]:
-    """Only explicit user-entered display fields belong in the resume header."""
-    if not isinstance(header, dict) or set(header) - _HEADER_LIMITS.keys():
-        raise ValueError("invalid resume header fields")
-    cleaned = {}
-    for field, value in header.items():
-        if not isinstance(value, str):
-            raise ValueError("invalid resume header value")
-        if field != "education" and ("\r" in value or "\n" in value):
-            raise ValueError("resume header requires single-line values")
-        value = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if len(value) > _HEADER_LIMITS[field]:
-            raise ValueError("resume header value too long")
-        if value:
-            cleaned[field] = value
-    return cleaned
+    return {"title": resume.title, "summary": resume.summary, "header": deepcopy(resume.header or {}), "items": deepcopy(resume.items)}
 
 
 def _content_hash(data: dict, plans: list[dict]) -> str:
     payload = {**data, "plans": plans}
-    # Empty optional fields do not change hashes of pre-header revisions.
+    # Preserve the hash convention of historical revisions with empty headers.
     if not payload.get("header"):
         payload.pop("header", None)
     return stable_hash(payload)
 
 
-def _guide_input(resume: dict) -> dict:
-    # Contact and education fields are a private, user-filled layout section;
-    # project interview generation must never forward them to a provider.
-    return {key: deepcopy(resume[key]) for key in ("title", "summary", "items")}
+def _guide_input(data: dict) -> dict:
+    # User-filled contact and education fields are private display metadata.
+    return {field: deepcopy(data[field]) for field in ("title", "summary", "items")}
 
 
 def _bound_plans(plans: list[dict], items: list[dict]) -> list[dict]:
@@ -84,15 +143,20 @@ def _bound_plans(plans: list[dict], items: list[dict]) -> list[dict]:
     return deepcopy([plan for plan in plans if plan["key"] in keys])
 
 
-def create_batch(session_factory: Callable[[], Session], *, jd: str, material: str, confirmed: bool, idempotency_key: str) -> Batch:
+def create_batch(session_factory: Callable[[], Session], *, jd: str, material: str, confirmed: bool, idempotency_key: str, profile: dict | None = None) -> Batch:
+    profile = validate_profile(profile)
     input_hash = stable_hash({"jd": jd, "material": material, "confirmed": confirmed})
     with session_factory() as session:
         existing = session.scalar(select(Batch).where(Batch.idempotency_key == idempotency_key))
         if existing:
-            if existing.input_hash != input_hash:
+            _require_current_v1(session, existing)
+            # Profile is display metadata outside the frozen-input hash, but a
+            # conflicting identity block under the same key is still a conflict,
+            # not something to silently ignore.
+            if existing.input_hash != input_hash or validate_profile(existing.profile) != profile:
                 raise InputConflict()
             return existing
-        batch = Batch(id=new_id(), idempotency_key=idempotency_key, input_hash=input_hash, jd_text=jd, material_text=material, material_confirmed=confirmed, status="queued", attempts=0, created_at=utcnow(), updated_at=utcnow())
+        batch = Batch(id=new_id(), idempotency_key=idempotency_key, input_hash=input_hash, jd_text=jd, material_text=material, material_confirmed=confirmed, status="queued", attempts=0, created_at=utcnow(), updated_at=utcnow(), profile=profile or None)
         session.add(batch)
         try:
             session.commit()
@@ -102,7 +166,8 @@ def create_batch(session_factory: Callable[[], Session], *, jd: str, material: s
             existing = session.scalar(select(Batch).where(Batch.idempotency_key == idempotency_key))
             if existing is None:
                 raise
-            if existing.input_hash != input_hash:
+            _require_current_v1(session, existing)
+            if existing.input_hash != input_hash or validate_profile(existing.profile) != profile:
                 raise InputConflict() from None
             return existing
         return batch
@@ -146,17 +211,17 @@ def _claim_batch(session_factory: Callable[[], Session]) -> Claim | None:
     now = utcnow()
     expired = or_(Batch.lease_until.is_(None), Batch.lease_until <= now)
     with session_factory() as session:
-        exhausted = session.scalars(select(Batch).where(Batch.status == "running", expired, Batch.attempts >= MAX_ATTEMPTS)).all()
+        exhausted = session.scalars(select(Batch).where(Batch.status == "running", expired, Batch.attempts >= MAX_ATTEMPTS, _batch_v1_safe())).all()
         for batch in exhausted:
-            result = session.execute(update(Batch).where(Batch.id == batch.id, Batch.status == "running", expired, Batch.attempts >= MAX_ATTEMPTS, Batch.claim_token == batch.claim_token).values(status="failed", error_code="ATTEMPTS_EXHAUSTED", lease_until=None, claim_token=None, updated_at=now).execution_options(synchronize_session=False))
+            result = session.execute(update(Batch).where(Batch.id == batch.id, Batch.status == "running", expired, Batch.attempts >= MAX_ATTEMPTS, _batch_v1_safe(), Batch.claim_token == batch.claim_token).values(status="failed", error_code="ATTEMPTS_EXHAUSTED", lease_until=None, claim_token=None, updated_at=now).execution_options(synchronize_session=False))
             if result.rowcount:
                 _finish_execution(session, batch.claim_token, "lease_expired", "ATTEMPTS_EXHAUSTED")
-        candidates = session.scalars(select(Batch).where(or_(Batch.status == "queued", and_(Batch.status == "running", expired)), Batch.attempts < MAX_ATTEMPTS).order_by(Batch.created_at, Batch.id).limit(5)).all()
+        candidates = session.scalars(select(Batch).where(or_(Batch.status == "queued", and_(Batch.status == "running", expired)), Batch.attempts < MAX_ATTEMPTS, _batch_v1_safe()).order_by(Batch.created_at, Batch.id).limit(5)).all()
         for batch in candidates:
             old_token = batch.claim_token
             token = new_id()
             attempt = batch.attempts + 1
-            result = session.execute(update(Batch).where(Batch.id == batch.id, Batch.attempts == batch.attempts, Batch.claim_token == old_token, or_(Batch.status == "queued", and_(Batch.status == "running", expired))).values(status="running", attempts=attempt, claim_token=token, lease_until=now + timedelta(seconds=LEASE_SECONDS), updated_at=now).execution_options(synchronize_session=False))
+            result = session.execute(update(Batch).where(Batch.id == batch.id, _batch_v1_safe(), Batch.attempts == batch.attempts, Batch.claim_token == old_token, or_(Batch.status == "queued", and_(Batch.status == "running", expired))).values(status="running", attempts=attempt, claim_token=token, lease_until=now + timedelta(seconds=LEASE_SECONDS), updated_at=now).execution_options(synchronize_session=False))
             if result.rowcount:
                 _finish_execution(session, old_token, "lease_expired", "LEASE_EXPIRED")
                 snapshot = {"jd": batch.jd_text, "material": batch.material_text, "confirmed": batch.material_confirmed}
@@ -172,25 +237,25 @@ def _claim_guide(session_factory: Callable[[], Session]) -> Claim | None:
     now = utcnow()
     expired = or_(Guide.lease_until.is_(None), Guide.lease_until <= now)
     with session_factory() as session:
-        exhausted = session.scalars(select(Guide).where(Guide.status == "running", expired, Guide.attempts >= MAX_ATTEMPTS)).all()
+        exhausted = session.scalars(select(Guide).where(Guide.status == "running", expired, Guide.attempts >= MAX_ATTEMPTS, _guide_v1_safe())).all()
         for guide in exhausted:
             if _lock_batch(session, guide.batch_id) is None:
                 continue
-            result = session.execute(update(Guide).where(Guide.id == guide.id, Guide.status == "running", expired, Guide.attempts >= MAX_ATTEMPTS, Guide.claim_token == guide.claim_token).values(status="failed", error_code="ATTEMPTS_EXHAUSTED", lease_until=None, claim_token=None).execution_options(synchronize_session=False))
+            result = session.execute(update(Guide).where(Guide.id == guide.id, Guide.status == "running", expired, Guide.attempts >= MAX_ATTEMPTS, _guide_v1_safe(), Guide.claim_token == guide.claim_token).values(status="failed", error_code="ATTEMPTS_EXHAUSTED", lease_until=None, claim_token=None).execution_options(synchronize_session=False))
             if result.rowcount:
                 _finish_execution(session, guide.claim_token, "lease_expired", "ATTEMPTS_EXHAUSTED")
                 revision = _guide_revision(session, guide)
                 revision.status, revision.error_code, revision.completed_at = "failed", "ATTEMPTS_EXHAUSTED", now
                 session.flush()
                 _refresh_batch_status(session, guide.batch_id)
-        candidates = session.scalars(select(Guide).join(Batch, Batch.id == Guide.batch_id).where(or_(Guide.status == "queued", and_(Guide.status == "running", expired)), Guide.attempts < MAX_ATTEMPTS).order_by(Batch.created_at, Guide.kind.desc(), Guide.id).limit(5)).all()
+        candidates = session.scalars(select(Guide).join(Batch, Batch.id == Guide.batch_id).where(or_(Guide.status == "queued", and_(Guide.status == "running", expired)), Guide.attempts < MAX_ATTEMPTS, _guide_v1_safe()).order_by(Batch.created_at, Guide.kind.desc(), Guide.id).limit(5)).all()
         for guide in candidates:
             if _lock_batch(session, guide.batch_id) is None:
                 continue
             old_token = guide.claim_token
             token = new_id()
             attempt = guide.attempts + 1
-            result = session.execute(update(Guide).where(Guide.id == guide.id, Guide.revision == guide.revision, Guide.attempts == guide.attempts, Guide.claim_token == old_token, or_(Guide.status == "queued", and_(Guide.status == "running", expired))).values(status="running", attempts=attempt, claim_token=token, lease_until=now + timedelta(seconds=LEASE_SECONDS)).execution_options(synchronize_session=False))
+            result = session.execute(update(Guide).where(Guide.id == guide.id, _guide_v1_safe(), Guide.revision == guide.revision, Guide.attempts == guide.attempts, Guide.claim_token == old_token, or_(Guide.status == "queued", and_(Guide.status == "running", expired))).values(status="running", attempts=attempt, claim_token=token, lease_until=now + timedelta(seconds=LEASE_SECONDS)).execution_options(synchronize_session=False))
             if result.rowcount:
                 revision = _guide_revision(session, guide)
                 snapshot = {"kind": guide.kind, "guide_revision": guide.revision, "resume_revision": revision.resume_revision, "resume": deepcopy(revision.resume_snapshot), "plans": deepcopy(revision.plans), "jd": revision.jd_text, "content_hash": revision.content_hash, "semantic_hash": revision.semantic_hash}
@@ -205,6 +270,11 @@ def _claim_guide(session_factory: Callable[[], Session]) -> Claim | None:
 
 
 def renew_execution(session_factory: Callable[[], Session], claim_token: str, lease_seconds: int = LEASE_SECONDS) -> bool:
+    """Renew a still-owned claim between bounded generation/review stages.
+
+    An expired or superseded claim cannot be revived. No background timer keeps
+    a stuck external call alive; final publication still checks ownership.
+    """
     if not 1 <= lease_seconds <= LEASE_SECONDS:
         raise ValueError("invalid lease duration")
     now = utcnow()
@@ -214,19 +284,19 @@ def renew_execution(session_factory: Callable[[], Session], claim_token: str, le
             return False
         model = Guide if execution.guide_id else Batch
         resource_id = execution.guide_id or execution.batch_id
-        result = session.execute(update(model).where(model.id == resource_id, model.status == "running", model.claim_token == claim_token, model.lease_until > now).values(lease_until=now + timedelta(seconds=lease_seconds)).execution_options(synchronize_session=False))
+        result = session.execute(update(model).where(model.id == resource_id, (_guide_v1_safe() if model is Guide else _batch_v1_safe()), model.status == "running", model.claim_token == claim_token, model.lease_until > now).values(lease_until=now + timedelta(seconds=lease_seconds)).execution_options(synchronize_session=False))
         session.commit()
         return bool(result.rowcount)
 
 
 def _batch_owned(claim: Claim):
-    return and_(Batch.id == claim.resource_id, Batch.status == "running", Batch.claim_token == claim.token, Batch.input_hash == claim.input_hash, Batch.lease_until > utcnow())
+    return and_(Batch.id == claim.resource_id, _batch_v1_safe(), Batch.status == "running", Batch.claim_token == claim.token, Batch.input_hash == claim.input_hash, Batch.lease_until > utcnow())
 
 
 def _guide_owned(claim: Claim):
     snap = claim.snapshot
     current_resume_matches = exists(select(Resume.id).where(Resume.id == Guide.resume_id, Resume.semantic_hash == snap["semantic_hash"]))
-    return and_(Guide.id == claim.resource_id, Guide.status == "running", Guide.claim_token == claim.token, Guide.revision == snap["guide_revision"], Guide.content_hash == snap["content_hash"], Guide.semantic_hash == snap["semantic_hash"], Guide.lease_until > utcnow(), current_resume_matches)
+    return and_(Guide.id == claim.resource_id, _guide_v1_safe(), Guide.status == "running", Guide.claim_token == claim.token, Guide.revision == snap["guide_revision"], Guide.content_hash == snap["content_hash"], Guide.semantic_hash == snap["semantic_hash"], Guide.lease_until > utcnow(), current_resume_matches)
 
 
 def _reject_execution(session: Session, claim: Claim, model) -> None:
@@ -240,14 +310,22 @@ def _source(provider: Provider) -> str:
 
 
 def _new_guide_revision(guide: Guide, resume: Resume, batch: Batch) -> GuideRevision:
-    return GuideRevision(id=new_id(), guide_id=guide.id, batch_id=batch.id, revision=guide.revision, resume_revision=resume.revision, content_hash=resume.content_hash, semantic_hash=resume.semantic_hash, resume_snapshot=_resume_data(resume), plans=deepcopy(resume.plans), jd_text=batch.jd_text, status="queued", created_at=utcnow())
+    return GuideRevision(id=new_id(), guide_id=guide.id, batch_id=batch.id, revision=guide.revision, resume_revision=resume.revision, content_hash=resume.content_hash, semantic_hash=resume.semantic_hash, resume_snapshot=_guide_input(_resume_data(resume)), plans=deepcopy(resume.plans), jd_text=batch.jd_text, status="queued", created_at=utcnow())
 
 
-def process_batch_once(session_factory: Callable[[], Session], provider: Provider) -> bool:
+def process_batch_once(session_factory: Callable[[], Session], provider: Provider, *, progress: Callable[[], None] | None = None) -> bool:
     claim = _claim_batch(session_factory)
     if claim is None:
         return False
     jd, material, confirmed = claim.snapshot["jd"], claim.snapshot["material"], claim.snapshot["confirmed"]
+    generation_source = _source(provider)
+
+    def checkpoint() -> None:
+        if not renew_execution(session_factory, claim.token):
+            raise InputConflict()
+        if progress is not None:
+            progress()
+
     try:
         if stable_hash(claim.snapshot) != claim.input_hash:
             raise ValueError("input fingerprint mismatch")
@@ -257,10 +335,20 @@ def process_batch_once(session_factory: Callable[[], Session], provider: Provide
         except (ValueError, TypeError):
             if not isinstance(provider, FallbackProvider) or _source(provider) == "degraded_local":
                 raise
+            logger.warning("provider fallback operation=bundle category=normalized_output_rejected http_status=-")
             content = normalize_bundle(LocalProvider().bundle(jd, material), jd, material, confirmed)
             provider.last_source = "degraded_local"
+        generation_source = _source(provider)
+        checkpoint()
+        content, review = review_bundle(content, jd=jd, material=material, confirmed=confirmed,
+                                        provider=provider, source=generation_source, checkpoint=checkpoint)
+        review["applies_to_semantic_hashes"] = {
+            kind: semantic_hash(data, _bound_plans(content["plans"], data["items"]), jd)
+            for kind, data in content["resumes"].items()
+        }
+        content["quality"] = {**content["quality"], "content_review": review}
         with session_factory() as session:
-            result = session.execute(update(Batch).where(_batch_owned(claim)).values(status="guides_pending", error_code=None, lease_until=None, claim_token=None, plans={"projects": content["plans"], "source": _source(provider)}, updated_at=utcnow()).execution_options(synchronize_session=False))
+            result = session.execute(update(Batch).where(_batch_owned(claim)).values(status="guides_pending", error_code=None, lease_until=None, claim_token=None, plans={"projects": content["plans"], "source": generation_source, "quality": content["quality"]}, updated_at=utcnow()).execution_options(synchronize_session=False))
             if not result.rowcount:
                 _reject_execution(session, claim, Batch)
                 session.commit()
@@ -268,24 +356,29 @@ def process_batch_once(session_factory: Callable[[], Session], provider: Provide
             batch = session.get(Batch, claim.batch_id)
             assert batch is not None
             for kind in ("job", "blueprint"):
-                data = content["resumes"][kind]
+                data = {**content["resumes"][kind], "header": deepcopy(validate_profile(batch.profile))}
                 plans = _bound_plans(content["plans"], data["items"])
-                resume = Resume(id=new_id(), batch_id=batch.id, kind=kind, title=data["title"], summary=data["summary"], header={}, items=deepcopy(data["items"]), plans=plans, content_hash=_content_hash(data, plans), semantic_hash=semantic_hash(data, plans, jd), revision=1, created_at=utcnow())
+                resume = Resume(id=new_id(), batch_id=batch.id, kind=kind, title=data["title"], summary=data["summary"], header=deepcopy(data["header"]), items=deepcopy(data["items"]), plans=plans, content_hash=_content_hash(data, plans), semantic_hash=semantic_hash(data, plans, jd), revision=1, created_at=utcnow())
                 session.add(resume)
                 session.flush()
-                session.add(ResumeRevision(id=new_id(), resume_id=resume.id, revision=1, title=resume.title, summary=resume.summary, header={}, items=deepcopy(resume.items), plans=deepcopy(plans), content_hash=resume.content_hash, semantic_hash=resume.semantic_hash))
+                session.add(ResumeRevision(id=new_id(), resume_id=resume.id, revision=1, title=resume.title, summary=resume.summary, header=deepcopy(resume.header), items=deepcopy(resume.items), plans=deepcopy(plans), content_hash=resume.content_hash, semantic_hash=resume.semantic_hash))
                 guide = Guide(id=new_id(), batch_id=batch.id, resume_id=resume.id, kind=kind, status="queued", content_hash=resume.content_hash, semantic_hash=resume.semantic_hash, revision=1, resume_revision=1, attempts=0)
                 session.add(guide)
                 session.flush()
                 session.add(_new_guide_revision(guide, resume, batch))
             _finish_execution(session, claim.token, "succeeded")
             session.commit()
-    except Exception:
+    except Exception as exc:
         # Diagnostics deliberately contain neither user input nor upstream text.
+        error_code = "CONTENT_REVIEW_FAILED" if isinstance(exc, ContentReviewBlocked) else "GENERATION_FAILED"
+        failure_values = {"status": "failed", "error_code": error_code, "lease_until": None,
+                          "claim_token": None, "updated_at": utcnow()}
+        if isinstance(exc, ContentReviewBlocked):
+            failure_values["plans"] = {"source": generation_source, "quality": {"content_review": exc.report}}
         with session_factory() as session:
-            result = session.execute(update(Batch).where(_batch_owned(claim)).values(status="failed", error_code="GENERATION_FAILED", lease_until=None, claim_token=None, updated_at=utcnow()).execution_options(synchronize_session=False))
+            result = session.execute(update(Batch).where(_batch_owned(claim)).values(**failure_values).execution_options(synchronize_session=False))
             if result.rowcount:
-                _finish_execution(session, claim.token, "failed", "GENERATION_FAILED")
+                _finish_execution(session, claim.token, "failed", error_code)
             else:
                 _reject_execution(session, claim, Batch)
             session.commit()
@@ -300,14 +393,14 @@ def process_guide_once(session_factory: Callable[[], Session], provider: Provide
     try:
         if stable_hash(snap) != claim.input_hash:
             raise ValueError("guide input fingerprint mismatch")
-        guide_resume = _guide_input(snap["resume"])
-        raw = provider.guide(snap["kind"], guide_resume, deepcopy(snap["plans"]), snap["jd"])
+        raw = provider.guide(snap["kind"], _guide_input(snap["resume"]), deepcopy(snap["plans"]), snap["jd"])
         try:
             entries = normalize_guide(raw, snap["resume"], snap["kind"])
         except (ValueError, TypeError):
             if not isinstance(provider, FallbackProvider) or _source(provider) == "degraded_local":
                 raise
-            entries = normalize_guide(LocalProvider().guide(snap["kind"], _guide_input(snap["resume"]), snap["plans"], snap["jd"]), snap["resume"], snap["kind"])
+            logger.warning("provider fallback operation=guide:%s category=normalized_output_rejected http_status=-", snap["kind"])
+            entries = normalize_guide(LocalProvider().guide(snap["kind"], snap["resume"], snap["plans"], snap["jd"]), snap["resume"], snap["kind"])
             provider.last_source = "degraded_local"
         sections = {"entries": entries, "source": _source(provider)}
         with session_factory() as session:
@@ -335,14 +428,32 @@ def process_guide_once(session_factory: Callable[[], Session], provider: Provide
     return True
 
 
+def update_profile(session_factory: Callable[[], Session], batch_id: str, profile: dict | None) -> dict:
+    """Edit only the queued batch's initial seed, before any resume exists."""
+    profile = validate_profile(profile)
+    with session_factory() as session:
+        batch = _lock_batch(session, batch_id)
+        if batch is None:
+            raise NotFound()
+        _require_current_v1(session, batch)
+        if batch.status != "queued" or session.scalar(select(Resume.id).where(Resume.batch_id == batch_id).limit(1)):
+            raise InputConflict()
+        result = session.execute(update(Batch).where(Batch.id == batch_id, _batch_v1_safe(), Batch.status == "queued", ~exists(select(Resume.id).where(Resume.batch_id == Batch.id))).values(profile=profile or None, updated_at=utcnow()).execution_options(synchronize_session=False))
+        if not result.rowcount:
+            raise InputConflict()
+        session.commit()
+    return get_batch(session_factory, batch_id)
+
+
 def retry_batch(session_factory: Callable[[], Session], batch_id: str) -> dict:
     with session_factory() as session:
         batch = _lock_batch(session, batch_id)
         if batch is None:
             raise NotFound()
+        _require_current_v1(session, batch)
         if batch.status != "failed" or session.scalar(select(Resume.id).where(Resume.batch_id == batch_id).limit(1)):
             raise InputConflict()
-        result = session.execute(update(Batch).where(Batch.id == batch_id, Batch.status == "failed", Batch.claim_token == batch.claim_token).values(status="queued", attempts=0, error_code=None, claim_token=None, lease_until=None, updated_at=utcnow()).execution_options(synchronize_session=False))
+        result = session.execute(update(Batch).where(Batch.id == batch_id, _batch_v1_safe(), Batch.status == "failed", Batch.claim_token == batch.claim_token).values(status="queued", attempts=0, error_code=None, claim_token=None, lease_until=None, updated_at=utcnow()).execution_options(synchronize_session=False))
         if not result.rowcount:
             raise InputConflict()
         _finish_execution(session, batch.claim_token, "superseded", "MANUAL_RETRY")
@@ -356,13 +467,14 @@ def retry_guide(session_factory: Callable[[], Session], batch_id: str, kind: str
         guide = session.scalar(select(Guide).where(Guide.batch_id == batch_id, Guide.kind == kind))
         if batch is None or guide is None:
             raise NotFound()
+        _require_current_v1(session, batch)
         if guide.status not in {"failed", "stale", "ready"}:
             raise InputConflict()
         resume = session.get(Resume, guide.resume_id)
         if resume is None:
             raise NotFound()
         next_revision = guide.revision + 1
-        result = session.execute(update(Guide).where(Guide.id == guide.id, Guide.revision == guide.revision, Guide.status == guide.status, Guide.claim_token == guide.claim_token).values(status="queued", revision=next_revision, resume_revision=resume.revision, content_hash=resume.content_hash, semantic_hash=resume.semantic_hash, sections=None, attempts=0, error_code=None, claim_token=None, lease_until=None).execution_options(synchronize_session=False))
+        result = session.execute(update(Guide).where(Guide.id == guide.id, _guide_v1_safe(), Guide.revision == guide.revision, Guide.status == guide.status, Guide.claim_token == guide.claim_token).values(status="queued", revision=next_revision, resume_revision=resume.revision, content_hash=resume.content_hash, semantic_hash=resume.semantic_hash, sections=None, attempts=0, error_code=None, claim_token=None, lease_until=None).execution_options(synchronize_session=False))
         if not result.rowcount:
             raise InputConflict()
         _finish_execution(session, guide.claim_token, "superseded", "MANUAL_RETRY")
@@ -372,7 +484,7 @@ def retry_guide(session_factory: Callable[[], Session], batch_id: str, kind: str
         session.commit()
 
 
-_ITEM_FIELDS = {"plan_key", "source_quote", "source_status", "verification_status", "achieved", "evidence", "resources", "resource_constraints", "verification", "role", "actions", "outcome"}
+_ITEM_FIELDS = {"plan_key", "source_quote", "source_status", "verification_status", "achieved", "evidence", "resources", "resource_constraints", "verification", "role", "actions", "outcome", "flags"}
 _SOURCE_STATES = {"none", "user_confirmed", "user_unconfirmed", "ai_generated"}
 _VERIFY_STATES = {"user_confirmed", "user_unconfirmed", "ai_generated"}
 
@@ -407,15 +519,26 @@ def _clean_items(resume: Resume, items: list[dict], material: str) -> list[dict]
             if field in item:
                 if field == "plan_key" and not old and not item[field]:
                     continue
+                if field == "flags":
+                    provided = item[field]
+                    if not isinstance(provided, list) or not all(isinstance(flag, str) and flag in KNOWN_ITEM_FLAGS for flag in provided):
+                        raise ValueError("invalid provenance")
+                    source[field] = list(provided)
+                    continue
                 source[field] = deepcopy(item[field])
         if text_changed:
             source["verification_status"] = "user_unconfirmed"
             source["achieved"] = False
+            # Generation-time flags describe the model's original draft; once the
+            # user edits the text they no longer apply to what is on screen.
+            source["flags"] = []
         explicit_confirmation = item.get("confirm") is True
         if explicit_confirmation:
             source["verification_status"] = "user_confirmed"
             source["source_status"] = "user_confirmed"
             source["achieved"] = item.get("achieved", source["achieved"])
+            if "flags" in source:
+                source["flags"] = [flag for flag in source["flags"] if flag != "achievement_unverified"]
         elif item.get("confirm") is False:
             if source["verification_status"] == "user_confirmed":
                 source["verification_status"] = "user_unconfirmed"
@@ -485,20 +608,23 @@ def save_resume(session_factory: Callable[[], Session], batch_id: str, kind: str
         resume = session.scalar(select(Resume).where(Resume.batch_id == batch_id, Resume.kind == kind))
         if batch is None or resume is None:
             raise NotFound()
+        _require_current_v1(session, batch)
         if resume.revision != revision:
             raise InputConflict()
-        saved_header = deepcopy(resume.header) if header is None else _clean_header(header)
+        saved_header = deepcopy(resume.header or {}) if header is None else validate_profile(header)
         cleaned = _clean_items(resume, items, batch.material_text)
         snapshot_plans = _sync_plans(resume.plans, resume.items, cleaned, plans)
         title, summary = title.strip(), summary.strip()
         if not (2 <= len(title) <= 160 and 4 <= len(summary) <= 1000):
             raise ValueError("invalid heading")
         data = {"title": title, "summary": summary, "header": saved_header, "items": cleaned}
-        content_hash = _content_hash(data, snapshot_plans)
-        fingerprint = semantic_hash(data, snapshot_plans, batch.jd_text)
-        changed = content_hash != resume.content_hash
+        # Migration captures old batch metadata without rewriting old hashes.
+        # Comparing saved values keeps an unchanged migrated draft a no-op.
+        changed = data != _resume_data(resume) or snapshot_plans != resume.plans
+        content_hash = _content_hash(data, snapshot_plans) if changed else resume.content_hash
+        fingerprint = semantic_hash(data, snapshot_plans, batch.jd_text) if changed else resume.semantic_hash
         next_revision = revision + 1 if changed else revision
-        result = session.execute(update(Resume).where(Resume.id == resume.id, Resume.revision == revision).values(revision=next_revision, title=title, summary=summary, header=saved_header, items=cleaned, plans=snapshot_plans, content_hash=content_hash, semantic_hash=fingerprint).execution_options(synchronize_session=False))
+        result = session.execute(update(Resume).where(Resume.id == resume.id, _v1_column(Resume.schema_version), exists(select(Batch.id).where(Batch.id == Resume.batch_id, _batch_v1_safe()).correlate(Resume)), Resume.revision == revision).values(revision=next_revision, title=title, summary=summary, header=saved_header, items=cleaned, plans=snapshot_plans, content_hash=content_hash, semantic_hash=fingerprint).execution_options(synchronize_session=False))
         if not result.rowcount:
             raise InputConflict()
         if changed:
@@ -521,33 +647,47 @@ def save_resume(session_factory: Callable[[], Session], batch_id: str, kind: str
     return get_batch(session_factory, batch_id)
 
 
-def list_revisions(session_factory: Callable[[], Session], batch_id: str, kind: str) -> list[dict]:
+def list_revisions(session_factory: Callable[[], Session], batch_id: str, kind: str, revision: int | None = None) -> list[dict]:
     with session_factory() as session:
         resume = session.scalar(select(Resume).where(Resume.batch_id == batch_id, Resume.kind == kind))
         if not resume:
             raise NotFound()
-        rows = session.scalars(select(ResumeRevision).where(ResumeRevision.resume_id == resume.id).order_by(ResumeRevision.revision.desc())).all()
-        return [{"revision": row.revision, "created_at": row.created_at.isoformat(), "title": row.title, "summary": row.summary, "header": deepcopy(row.header), "items": row.items, "plans": row.plans, "content_hash": row.content_hash, "semantic_hash": row.semantic_hash} for row in rows]
+        if revision is None:
+            _require_v1(resume)
+        query = select(ResumeRevision).where(ResumeRevision.resume_id == resume.id)
+        if revision is not None:
+            query = query.where(ResumeRevision.revision == revision)
+        rows = session.scalars(query.order_by(ResumeRevision.revision.desc())).all()
+        for row in rows:
+            _require_v1(row)
+        return [{"revision": row.revision, "created_at": row.created_at.isoformat(), "title": row.title, "summary": row.summary, "header": deepcopy(row.header or {}), "items": row.items, "plans": row.plans, "content_hash": row.content_hash, "semantic_hash": row.semantic_hash, "content_review": _review_view(resume.batch, kind, row.semantic_hash, row.plans)} for row in rows]
 
 
 def get_resume_revision(session_factory: Callable[[], Session], batch_id: str, kind: str, revision: int) -> dict:
-    for row in list_revisions(session_factory, batch_id, kind):
+    for row in list_revisions(session_factory, batch_id, kind, revision):
         if row["revision"] == revision:
             return row
     raise NotFound()
 
 
-def list_guide_revisions(session_factory: Callable[[], Session], batch_id: str, kind: str) -> list[dict]:
+def list_guide_revisions(session_factory: Callable[[], Session], batch_id: str, kind: str, revision: int | None = None) -> list[dict]:
     with session_factory() as session:
         guide = session.scalar(select(Guide).where(Guide.batch_id == batch_id, Guide.kind == kind))
         if guide is None:
             raise NotFound()
-        rows = session.scalars(select(GuideRevision).where(GuideRevision.guide_id == guide.id).order_by(GuideRevision.revision.desc())).all()
+        if revision is None:
+            _require_v1(guide)
+        query = select(GuideRevision).where(GuideRevision.guide_id == guide.id)
+        if revision is not None:
+            query = query.where(GuideRevision.revision == revision)
+        rows = session.scalars(query.order_by(GuideRevision.revision.desc())).all()
+        for row in rows:
+            _require_v1(row)
         return [{"id": row.id, "revision": row.revision, "resume_revision": row.resume_revision, "content_hash": row.content_hash, "semantic_hash": row.semantic_hash, "resume": row.resume_snapshot, "plans": row.plans, "jd_text": row.jd_text, "status": row.status, "source": row.sections.get("source") if row.sections else None, "entries": row.sections.get("entries", []) if row.sections else [], "error_code": row.error_code, "created_at": row.created_at.isoformat(), "completed_at": row.completed_at.isoformat() if row.completed_at else None} for row in rows]
 
 
 def get_guide_revision(session_factory: Callable[[], Session], batch_id: str, kind: str, revision: int) -> dict:
-    for row in list_guide_revisions(session_factory, batch_id, kind):
+    for row in list_guide_revisions(session_factory, batch_id, kind, revision):
         if row["revision"] == revision:
             return row
     raise NotFound()
@@ -555,11 +695,26 @@ def get_guide_revision(session_factory: Callable[[], Session], batch_id: str, ki
 
 def list_executions(session_factory: Callable[[], Session], batch_id: str) -> list[dict]:
     with session_factory() as session:
-        if session.get(Batch, batch_id) is None:
+        batch = session.get(Batch, batch_id)
+        if batch is None:
             raise NotFound()
+        _require_current_v1(session, batch)
         rows = session.scalars(select(TaskExecution).where(TaskExecution.batch_id == batch_id).order_by(TaskExecution.started_at, TaskExecution.id)).all()
         # Full frozen inputs stay private in the DB, never in diagnostic listings.
         return [{"id": row.id, "task_type": row.task_type, "guide_id": row.guide_id, "attempt": row.attempt, "input_hash": row.input_hash, "status": row.status, "error_code": row.error_code, "started_at": row.started_at.isoformat(), "finished_at": row.finished_at.isoformat() if row.finished_at else None} for row in rows]
+
+
+def require_v1_deletion(session_factory: Callable[[], Session], batch_id: str) -> None:
+    """The v1 deletion journal cannot yet remove the v2 dependency graph."""
+    with session_factory() as session:
+        batch = session.get(Batch, batch_id)
+        if batch is None:
+            raise NotFound()
+        _require_current_v1(session, batch)
+        for revision in session.scalars(select(ResumeRevision).join(Resume, Resume.id == ResumeRevision.resume_id).where(Resume.batch_id == batch_id)):
+            _require_v1(revision)
+        for revision in session.scalars(select(GuideRevision).where(GuideRevision.batch_id == batch_id)):
+            _require_v1(revision)
 
 
 def get_batch(session_factory: Callable[[], Session], batch_id: str) -> dict:
@@ -567,29 +722,69 @@ def get_batch(session_factory: Callable[[], Session], batch_id: str) -> dict:
         batch = session.get(Batch, batch_id)
         if not batch:
             raise NotFound()
+        _require_current_v1(session, batch)
         return serialize_batch(batch)
 
 
 def latest_batch(session_factory: Callable[[], Session]) -> dict | None:
     with session_factory() as session:
         batch = session.scalar(select(Batch).order_by(Batch.created_at.desc()).limit(1))
+        if batch:
+            _require_current_v1(session, batch)
         return serialize_batch(batch) if batch else None
 
 
 def list_batches(session_factory: Callable[[], Session], limit: int = 20) -> list[dict]:
     with session_factory() as session:
         rows = session.scalars(select(Batch).order_by(Batch.created_at.desc()).limit(limit)).all()
+        for row in rows:
+            _require_current_v1(session, row)
         return [{"id": row.id, "status": row.status, "created_at": row.created_at.isoformat(), "jd_excerpt": row.jd_text[:60]} for row in rows]
+
+
+def _review_view(batch: Batch, kind: str, fingerprint: str, plans: list[dict]) -> dict | None:
+    report = (batch.plans or {}).get("quality", {}).get("content_review")
+    if not report:
+        return None
+    keys = {plan["key"] for plan in plans}
+    issues = [issue for issue in report.get("issues", []) if any(
+        target["scope"] == kind or (target["scope"] == "plan" and target["target_id"] in keys)
+        for target in issue["targets"])]
+    current = report.get("applies_to_semantic_hashes", {}).get(kind) == fingerprint
+    repair_count = sum(1 for edit in report.get("edits", []) if edit["scope"] == kind or (edit["scope"] == "plan" and edit["target_id"] in keys))
+    status = report["status"]
+    if status in {"passed", "repaired", "suggestions"}:
+        status = "repaired" if repair_count else "suggestions" if issues else "passed"
+    return {"status": status if current else "stale", "source": report["source"],
+            "reason": report.get("reason"), "issues": deepcopy(issues),
+            "repair_count": repair_count}
 
 
 def serialize_batch(batch: Batch) -> dict:
     resumes = {resume.kind: resume for resume in batch.resumes}
+
+    def present(resume: Resume) -> dict:
+        data = _resume_data(resume)
+        # Display signals are computed at read time and kept outside `items`:
+        # stored item snapshots must stay byte-identical to what guides and
+        # revisions captured, or snapshot comparisons silently break.
+        signals = {}
+        if resume.kind == "job":
+            for item in data["items"]:
+                signals[item["id"]] = {
+                    "unverified_numbers": unverified_numbers(item["text"], batch.jd_text, batch.material_text),
+                    "gap_phrases": gap_phrases(item["text"]),
+                }
+        return {"id": resume.id, **data, "signals": signals, "plans": deepcopy(resume.plans), "content_hash": resume.content_hash, "semantic_hash": resume.semantic_hash, "revision": resume.revision, "content_review": _review_view(batch, resume.kind, resume.semantic_hash, resume.plans)}
+
     return {
         "id": batch.id, "status": batch.status, "error_code": batch.error_code,
         "jd_text": batch.jd_text, "material_text": batch.material_text, "material_confirmed": batch.material_confirmed,
+        "profile": deepcopy(batch.profile) if batch.profile else {},
         "created_at": batch.created_at.isoformat(),
         "source": batch.plans.get("source") if batch.plans else None,
+        "quality": batch.plans.get("quality") if batch.plans else None,
         "unverified_targets": [plan["target_inference"] for plan in batch.plans.get("projects", []) if plan.get("target_evidence_status") == "ai_inferred"] if batch.plans else [],
-        "resumes": {resume.kind: {"id": resume.id, **_resume_data(resume), "plans": deepcopy(resume.plans), "content_hash": resume.content_hash, "semantic_hash": resume.semantic_hash, "revision": resume.revision} for resume in batch.resumes},
+        "resumes": {resume.kind: present(resume) for resume in batch.resumes},
         "guides": {guide.kind: {"status": guide.status, "revision": guide.revision, "resume_revision": guide.resume_revision, "applies_to_revision": resumes[guide.kind].revision if guide.status == "ready" and guide.semantic_hash == resumes[guide.kind].semantic_hash else None, "content_hash": guide.content_hash, "semantic_hash": guide.semantic_hash, "source": guide.sections.get("source") if guide.sections else None, "entries": guide.sections.get("entries", []) if guide.sections else [], "error_code": guide.error_code} for guide in batch.guides},
     }

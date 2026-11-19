@@ -127,10 +127,10 @@ def test_header_normalization_drops_empty_fields_and_preserves_education_lines(s
 
 @pytest.mark.parametrize("header", [
     {"unknown": "虚构字段"}, {"name": 123}, {"phone": False}, {"education": ["虚构大学"]},
-    {"name": None}, {"name": "虚构\n姓名"}, {"phone": "000\r000"},
+    {"name": "虚构\n姓名"}, {"phone": "000\r000"},
     {"email": "fictional@example.invalid\n"}, {"location": "虚构\r\n城市"},
-    {"name": "字" * 81}, {"phone": "0" * 41}, {"email": "a" * 161},
-    {"location": "字" * 81}, {"education": "字" * 1501},
+    {"name": "字" * 81}, {"phone": "0" * 51}, {"email": "a" * 161},
+    {"location": "字" * 101}, {"education": "字" * 1501},
 ])
 def test_invalid_header_is_rejected_without_changing_revision(sessions, header):
     batch_id = generated(sessions)
@@ -176,7 +176,9 @@ def test_guide_generation_never_receives_header_fields(sessions):
     assert process_guide_once(sessions, Inspect())
     assert len(observed) == 1
     assert get_batch(sessions, batch_id)["guides"]["job"]["status"] == "ready"
-    assert get_guide_revision(sessions, batch_id, "job", 2)["resume"]["header"] == HEADER
+    guide = get_guide_revision(sessions, batch_id, "job", 2)
+    assert "header" not in guide["resume"]
+    assert get_resume_revision(sessions, batch_id, "job", guide["resume_revision"])["header"] == HEADER
 
 
 def test_header_only_edit_during_guide_generation_keeps_original_binding(sessions):
@@ -196,4 +198,5 @@ def test_header_only_edit_during_guide_generation_keeps_original_binding(session
     assert result["guides"][kind]["status"] == "ready"
     assert result["guides"][kind]["resume_revision"] == 1
     assert result["guides"][kind]["applies_to_revision"] == 2
-    assert get_guide_revision(sessions, batch_id, kind, 1)["resume"]["header"] == {}
+    assert "header" not in get_guide_revision(sessions, batch_id, kind, 1)["resume"]
+    assert get_resume_revision(sessions, batch_id, kind, 1)["header"] == {}

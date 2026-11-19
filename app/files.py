@@ -138,9 +138,13 @@ def extract_material(name: str, data: bytes) -> str:
     return text
 
 
-def _header_content(resume: dict) -> tuple[str, str, str]:
-    """Manual resume fields; missing identity stays an explicit writing space."""
-    header = resume.get("header") or {}
+def _profile_header(resume: dict, profile: dict | None) -> tuple[str, str, str]:
+    """A saved header takes precedence, including intentionally cleared fields.
+
+    Explicit profile remains a fallback for older standalone renderer callers.
+    Missing identity leaves writing space without inventing personal details.
+    """
+    header = (resume.get("header") or {}) if "header" in resume else (profile or {})
     name = header.get("name") or "姓名：________________"
     contact = "  |  ".join(
         f"{label}：{header.get(key) or blank}"
@@ -154,14 +158,17 @@ def _header_content(resume: dict) -> tuple[str, str, str]:
     return name, contact, education
 
 
-def render_html(resume: dict) -> bytes:
-    heading = escape(resume["title"])
+def render_html(resume: dict, footer: str | None = None, profile: dict | None = None) -> bytes:
+    heading, contact, education = _profile_header(resume, profile)
     summary = escape(resume["summary"])
-    name, contact, education = map(escape, _header_content(resume))
     items = "".join(f"<li>{escape(item['text'])}</li>" for item in resume["items"])
-    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>{heading}</title>
-<style>@page{{size:A4;margin:18mm}}body{{font:10.5pt/1.6 {HTML_FONT_STACK};color:#182838;max-width:800px;margin:auto;overflow-wrap:anywhere}}h1{{font-size:20pt;margin:0 0 2mm}}h2{{font-size:12pt;margin:6mm 0 3mm;break-after:avoid}}p,li{{white-space:pre-wrap}}.contact{{font-size:9.5pt;margin:0 0 6mm}}.education{{margin:0;min-height:12mm}}li{{margin:0 0 4mm}}@media print{{body{{max-width:none}}}}</style>
-<header><h1>{name}</h1><p class="contact">{contact}</p></header><h2>教育经历</h2><p class="education">{education}</p><h2>{heading}</h2><p>{summary}</p><h2>项目与能力</h2><ol>{items}</ol></html>'''.encode("utf-8")
+    note = f'<footer class="export-note">{escape(footer)}</footer>' if footer else ""
+    subtitle = f'<p class="intent">{escape(resume["title"])}</p>'
+    contact_html = f'<p class="contact">{escape(contact)}</p>'
+    education_html = f'<h2>教育背景</h2><p>{escape(education)}</p>'
+    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>{escape(heading)}</title>
+<style>@page{{size:A4;margin:18mm}}body{{font:10.5pt/1.6 {HTML_FONT_STACK};color:#182838;max-width:800px;margin:auto;overflow-wrap:anywhere}}h1{{font-size:20pt;margin:0 0 2mm}}h2{{font-size:12pt;margin:8mm 0 3mm;break-after:avoid}}p,li{{white-space:pre-wrap}}li{{margin:0 0 4mm}}.contact{{color:#5a6b7b;font-size:9.5pt;margin:0 0 6mm}}.intent{{color:#34465a;font-size:11pt;margin:0 0 6mm}}.export-note{{margin-top:10mm;font-size:8.5pt;color:#8a94a0;border-top:1px solid #d5dce3;padding-top:2mm}}@media print{{body{{max-width:none}}}}</style>
+<h1>{escape(heading)}</h1>{contact_html}{subtitle}<p>{summary}</p>{education_html}<h2>项目与能力</h2><ol>{items}</ol>{note}</html>'''.encode("utf-8")
 
 
 def render_guide_html(guide: dict, resume: dict) -> bytes:
@@ -184,7 +191,7 @@ def render_guide_html(guide: dict, resume: dict) -> bytes:
 <h1>{title}</h1>{binding}{entries}</html>'''.encode("utf-8")
 
 
-def render_docx(resume: dict) -> bytes:
+def render_docx(resume: dict, footer: str | None = None, profile: dict | None = None) -> bytes:
     document = Document()
     section = document.sections[0]
     section.page_width, section.page_height = Cm(21), Cm(29.7)
@@ -206,34 +213,57 @@ def render_docx(resume: dict) -> bytes:
     title_properties = document.styles["Title"].element.get_or_add_pPr()
     for border in title_properties.findall(qn("w:pBdr")):
         title_properties.remove(border)
-    name, contact, education = _header_content(resume)
-    document.add_heading(name, 0)
-    document.add_paragraph(contact)
-    document.add_heading("教育经历", 1)
-    document.add_paragraph(education)
-    document.add_heading(resume["title"], 1)
+    heading, contact, education = _profile_header(resume, profile)
+    document.add_heading(heading, 0)
+    line = document.add_paragraph()
+    run = line.add_run(contact)
+    run.font.size = Pt(9.5)
+    run.font.color.rgb = RGBColor.from_string("5A6B7B")
+    intent = document.add_paragraph()
+    run = intent.add_run(resume["title"])
+    run.font.size = Pt(11)
+    run.font.color.rgb = RGBColor.from_string("34465A")
     document.add_paragraph(resume["summary"])
+    document.add_heading("教育背景", 1)
+    document.add_paragraph(education)
     document.add_heading("项目与能力", 1)
     for item in resume["items"]:
         document.add_paragraph(item["text"], style="List Number")
+    if footer:
+        note = document.add_paragraph()
+        run = note.add_run(footer)
+        run.font.size = Pt(8.5)
+        run.font.color.rgb = RGBColor.from_string("8A94A0")
     out = BytesIO()
     document.save(out)
     return out.getvalue()
 
 
-def render_pdf(resume: dict) -> bytes:
-    name, contact, education = _header_content(resume)
-    content = [name, contact, "教育经历", education, resume["title"], resume["summary"], "项目与能力"] + [item["text"] for item in resume["items"]]
-    font_name = _pdf_font("\n".join(content) + "0123456789.")
+def render_pdf(resume: dict, footer: str | None = None, profile: dict | None = None) -> bytes:
+    heading, contact, education = _profile_header(resume, profile)
+    content = [heading, contact, resume["title"], resume["summary"], "教育背景", education, "项目与能力"] + [item["text"] for item in resume["items"]]
+    if footer:
+        content.append(footer)
+    font_name = _pdf_font("\n".join(content) + "0123456789.·")
     regular = ParagraphStyle("regular", fontName=font_name, fontSize=10.5, leading=17, spaceAfter=8, alignment=TA_LEFT, textColor=colors.HexColor("#253444"), wordWrap="CJK", splitLongWords=True, allowWidows=False, allowOrphans=False)
-    title = ParagraphStyle("title", parent=regular, fontSize=20, leading=28, spaceAfter=8, keepWithNext=True)
-    contact_style = ParagraphStyle("contact", parent=regular, fontSize=9.5, leading=16, spaceAfter=10)
+    title = ParagraphStyle("title", parent=regular, fontSize=20, leading=28, spaceAfter=22)
     section = ParagraphStyle("section", parent=regular, fontSize=12, leading=19, spaceBefore=12, spaceAfter=10, keepWithNext=True)
+    contact_style = ParagraphStyle("contact", parent=regular, fontSize=9.5, leading=14, spaceAfter=10, textColor=colors.HexColor("#5A6B7B"))
+    intent = ParagraphStyle("intent", parent=regular, fontSize=11, leading=16, spaceAfter=10, textColor=colors.HexColor("#34465A"))
     out = BytesIO()
     doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=50, rightMargin=50, topMargin=50, bottomMargin=50, initialFontName=font_name, lang="zh-CN")
-    story = [Paragraph(_paragraph_text(name), title), Paragraph(_paragraph_text(contact), contact_style), Paragraph("教育经历", section), Paragraph(_paragraph_text(education), regular), Paragraph(_paragraph_text(resume["title"]), section), Paragraph(_paragraph_text(resume["summary"]), regular), Paragraph("项目与能力", section)]
+    story = [Paragraph(_paragraph_text(heading), title)]
+    story.append(Paragraph(_paragraph_text(contact), contact_style))
+    story.append(Paragraph(_paragraph_text(resume["title"]), intent))
+    story.append(Paragraph(_paragraph_text(resume["summary"]), regular))
+    story.append(Paragraph("教育背景", section))
+    story.append(Paragraph(_paragraph_text(education), regular))
+    story.append(Paragraph("项目与能力", section))
     for index, item in enumerate(resume["items"], 1):
         story.append(Paragraph(f"{index}. " + _paragraph_text(item["text"]), regular))
+    if footer:
+        note = ParagraphStyle("export-note", parent=regular, fontSize=8.5, leading=12, spaceBefore=16, textColor=colors.HexColor("#8A94A0"))
+        story.append(Paragraph(_paragraph_text(footer), note))
     doc.build(story)
     result = out.getvalue()
     return _unicode_pdf(result) if any(ord(character) > 0xFFFF for text in content for character in text) else result

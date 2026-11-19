@@ -12,10 +12,12 @@ from pydantic import BaseModel, Field
 
 from app.db import SessionLocal
 from app.files import extract_material, render_docx, render_guide_html, render_html, render_pdf
-from app.service import (InputConflict, NotFound, create_batch, get_batch, list_batches,
+from app.service import (ClientUpgradeRequired, InputConflict, NotFound, create_batch, get_batch, list_batches,
     list_revisions, retry_guide, save_resume, retry_batch, get_resume_revision,
-    list_guide_revisions, get_guide_revision, list_executions)
+    list_guide_revisions, get_guide_revision, list_executions, update_profile, require_v1_deletion)
 from app.privacy import JournalUnavailable, delete_batch, deleted_ids, initialize_journal, replay_deletions
+from app.api_v2 import router as v2_router
+from app.materials_api_v2 import router as materials_v2_router
 
 
 @asynccontextmanager
@@ -27,8 +29,15 @@ async def lifespan(_app):
     yield
 
 app = FastAPI(title="双版本简历工作台", docs_url=None, redoc_url=None, lifespan=lifespan)
+app.include_router(v2_router)
+app.include_router(materials_v2_router)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 STATIC = Path(__file__).parent / "static"
+
+
+@app.exception_handler(ClientUpgradeRequired)
+async def client_upgrade_required(_request, _error):
+    return JSONResponse({"code": "CLIENT_UPGRADE_REQUIRED", "detail": "该记录使用新版格式，请升级客户端后操作"}, status_code=409)
 
 
 @app.exception_handler(JournalUnavailable)
@@ -73,15 +82,20 @@ class CreateBatchBody(BaseModel):
     jd_text: str = Field(min_length=20, max_length=15000)
     material_text: str = Field(default="", max_length=20000)
     material_confirmed: bool = False
+    profile: dict | None = None
+
+
+class ProfileBody(BaseModel):
+    profile: dict | None = None
 
 
 class SaveResumeBody(BaseModel):
     revision: int = Field(ge=1)
     title: str = Field(min_length=2, max_length=160)
     summary: str = Field(min_length=4, max_length=1000)
-    header: dict | None = None
     items: list[dict] = Field(min_length=1, max_length=20)
     plans: list[dict] | None = Field(default=None, max_length=20)
+    header: dict | None = None
 
 
 @app.get("/")
@@ -93,9 +107,18 @@ def index():
     return Response(content, media_type="text/html")
 
 
+@app.get("/v2")
+def v2_index():
+    content = (STATIC / "v2.html").read_text()
+    for name in ("style.css", "v2.css", "v2.js"):
+        version = sha256((STATIC / name).read_bytes()).hexdigest()[:12]
+        content = content.replace(f'/static/{name}"', f'/static/{name}?v={version}"')
+    return Response(content, media_type="text/html")
+
+
 @app.get("/static/{name}")
 def static(name: str):
-    if name not in {"app.js", "style.css"}:
+    if name not in {"app.js", "style.css", "v2.js", "v2.css"}:
         raise HTTPException(status_code=404)
     return FileResponse(STATIC / name)
 
@@ -116,16 +139,33 @@ def health():
 @app.get("/api/config")
 def public_config():
     import os
-    return {"provider": os.getenv("COACH_PROVIDER", "local"), "scope": "personal_local"}
+    provider = os.getenv("COACH_PROVIDER", "local")
+    return {"provider": provider, "scope": "personal_local",
+            "model": os.getenv("COACH_MODEL", "") if provider == "compatible" else None}
 
 
 @app.post("/api/batches", status_code=202)
 def create(body: CreateBatchBody, idempotency_key: str = Header(min_length=8, max_length=128)):
     try:
-        batch = create_batch(SessionLocal, jd=body.jd_text.strip(), material=body.material_text.strip(), confirmed=body.material_confirmed, idempotency_key=idempotency_key)
+        batch = create_batch(SessionLocal, jd=body.jd_text.strip(), material=body.material_text.strip(), confirmed=body.material_confirmed, idempotency_key=idempotency_key, profile=body.profile)
     except InputConflict:
         raise HTTPException(status_code=409, detail="请求标识对应的输入已变化") from None
+    except ValueError:
+        raise HTTPException(status_code=422, detail="联系信息格式无效") from None
     return {"id": batch.id, "status": batch.status, "status_url": f"/api/batches/{batch.id}"}
+
+
+@app.patch("/api/batches/{batch_id}/profile")
+def update_profile_route(batch_id: str, body: ProfileBody):
+    ensure_available(batch_id)
+    try:
+        return update_profile(SessionLocal, batch_id, body.profile)
+    except NotFound:
+        raise HTTPException(status_code=404, detail="未找到该生成记录") from None
+    except InputConflict:
+        raise HTTPException(status_code=409, detail="生成已开始，请通过编辑本版保存个人信息") from None
+    except ValueError:
+        raise HTTPException(status_code=422, detail="联系信息格式无效") from None
 
 
 @app.get("/api/batches/latest")
@@ -167,6 +207,7 @@ def retry_batch_route(batch_id: str):
 @app.delete("/api/batches/{batch_id}", status_code=204)
 def delete_batch_route(batch_id: str):
     try:
+        require_v1_deletion(SessionLocal, batch_id)
         delete_batch(SessionLocal, batch_id)
     except NotFound:
         raise HTTPException(status_code=404, detail="未找到该生成记录") from None
@@ -278,12 +319,20 @@ def download(batch_id: str, kind: str, format: str, revision: int | None = None)
     if kind not in {"job", "blueprint"} or format not in {"html", "docx", "pdf"}:
         raise HTTPException(status_code=404)
     try:
-        resume = get_resume_revision(SessionLocal, batch_id, kind, revision) if revision is not None else get_batch(SessionLocal, batch_id)["resumes"][kind]
+        if revision is not None:
+            resume = get_resume_revision(SessionLocal, batch_id, kind, revision)
+        else:
+            batch = get_batch(SessionLocal, batch_id)
+            resume = batch["resumes"][kind]
     except (NotFound, KeyError):
         raise HTTPException(status_code=404, detail="未找到该简历") from None
+    # Blueprint bodies may contain unachieved plans. The on-screen preview stays
+    # unmarked per the v3 presentation rule, but an exported file leaves the app
+    # and can be submitted as-is, so exports carry a visible note.
+    footer = "蓝图 Plus · 包含尚未完成的项目规划，仅供准备参考，请勿作为已核实简历投递" if kind == "blueprint" else None
     renderer = {"html": render_html, "docx": render_docx, "pdf": render_pdf}[format]
     try:
-        content = renderer(resume)
+        content = renderer(resume, footer=footer)
     except Exception:
         raise HTTPException(status_code=503, detail="文件生成失败，请稍后重试") from None
     media = {"html": "text/html; charset=utf-8", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "pdf": "application/pdf"}[format]
